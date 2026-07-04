@@ -839,6 +839,7 @@ backup_one() {
         done
 
         rm -f "${archive}"
+        record_manifest "${name}"
         log "  ✓ 完成"
     done
 }
@@ -866,25 +867,49 @@ clean_old_by_count() {
     done <<< "${to_delete}"
 }
 
-# ---------- 按天数清理 ----------
+# ---------- 按天数清理（仅清理本脚本备份的子目录） ----------
 
 clean_old_by_days() {
-    local remote="$1"
-    log "━━━ 清理过期备份（保留 ${RETENTION_DAYS} 天）━━━"
-    rclone delete "${remote}" \
+    local remote_dir="$1"
+    log "  清理 ${remote_dir} 中 ${RETENTION_DAYS} 天前的文件..."
+    rclone delete "${remote_dir}" \
         --min-age "${RETENTION_DAYS}d" \
-        -P --log-file="${LOG_FILE}" --log-level INFO 2>/dev/null || \
+        --log-file="${LOG_FILE}" --log-level INFO 2>/dev/null || \
         log "  ⚠ 清理出错（不影响本次备份）"
 }
 
-# ---------- 孤儿目录清理 ----------
+# ---------- 孤儿目录清理（仅清理本脚本管理的目录） ----------
+
+# 记录本次备份的目录到清单
+record_manifest() {
+    local name="$1"
+    # 去重写入
+    if [ -f "${MANIFEST_FILE}" ]; then
+        grep -qxF "$name" "${MANIFEST_FILE}" 2>/dev/null || echo "$name" >> "${MANIFEST_FILE}"
+    else
+        echo "$name" > "${MANIFEST_FILE}"
+    fi
+}
 
 clean_orphan_dirs() {
     local remote="$1"
-    log "━━━ 清理孤儿目录（不在清单中的远程目录）━━━"
 
-    # 构建当前应存在的目录名集合
-    local valid_names=()
+    # 清单文件不存在则跳过（首次运行，不会误删任何东西）
+    if [ ! -f "${MANIFEST_FILE}" ]; then
+        log "  清单文件不存在，跳过孤儿清理"
+        return 0
+    fi
+
+    # 读取清单中记录的目录名
+    local managed_names=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && managed_names+=("$line")
+    done < "${MANIFEST_FILE}"
+
+    [ ${#managed_names[@]} -eq 0 ] && return 0
+
+    # 构建当前仍在备份的目录名集合
+    local active_names=()
     for item_entry in "${BACKUP_ITEMS[@]}"; do
         local resolved_items=()
         if [[ "$item_entry" == *"*"* || "$item_entry" == *"?"* || "$item_entry" == *"["* ]]; then
@@ -895,30 +920,31 @@ clean_orphan_dirs() {
             resolved_items=("$item_entry")
         fi
         for item in "${resolved_items[@]}"; do
-            [ -e "${item}" ] && valid_names+=("$(basename "${item}")")
+            [ -e "${item}" ] && active_names+=("$(basename "${item}")")
         done
     done
 
-    # 列出远程目录
-    local remote_dirs
-    remote_dirs=$(rclone lsf "${remote}" --dirs-only 2>/dev/null || true)
-    [ -z "${remote_dirs}" ] && return 0
-
-    while IFS= read -r rdir; do
-        [ -z "${rdir}" ] && continue
-        rdir="${rdir%/}"
-        local is_valid=false
-        for vn in "${valid_names[@]}"; do
-            if [ "$rdir" = "$vn" ]; then
-                is_valid=true
+    # 只清理：在清单中 AND 不在当前备份项中 的目录
+    log "━━━ 清理已移除的备份目录（仅限本脚本管理的目录）━━━"
+    for managed in "${managed_names[@]}"; do
+        local is_active=false
+        for active in "${active_names[@]}"; do
+            if [ "$managed" = "$active" ]; then
+                is_active=true
                 break
             fi
         done
-        if [ "$is_valid" = false ]; then
-            log "  🗑 孤儿目录: ${remote}${rdir}/"
-            rclone purge "${remote}${rdir}/" 2>/dev/null || true
+        if [ "$is_active" = false ]; then
+            # 二次确认：远程目录确实存在才删
+            if rclone lsf "${remote}${managed}/" --dirs-only &>/dev/null; then
+                log "  🗑 清理: ${remote}${managed}/（已从备份项中移除）"
+                rclone purge "${remote}${managed}/" 2>/dev/null || true
+            fi
         fi
-    done <<< "${remote_dirs}"
+    done
+
+    # 更新清单：只保留当前活跃的
+    printf "%s\n" "${active_names[@]}" > "${MANIFEST_FILE}"
 }
 
 # ---------- 清理调度 ----------
@@ -945,7 +971,24 @@ clean_old() {
                 done
             done
         else
-            clean_old_by_days "${remote}"
+            log "━━━ 清理过期备份（保留 ${RETENTION_DAYS} 天）━━━"
+            for item_entry in "${BACKUP_ITEMS[@]}"; do
+                local resolved_items=()
+                if [[ "$item_entry" == *"*"* || "$item_entry" == *"?"* || "$item_entry" == *"["* ]]; then
+                    while IFS= read -r -d '' resolved; do
+                        resolved_items+=("$resolved")
+                    done < <(eval "printf '%s\0' $item_entry" 2>/dev/null || true)
+                else
+                    resolved_items=("$item_entry")
+                fi
+                for item in "${resolved_items[@]}"; do
+                    if [ -e "${item}" ]; then
+                        local item_name
+                        item_name=$(basename "${item}")
+                        clean_old_by_days "${remote}/${item_name}/"
+                    fi
+                done
+            done
         fi
         # 孤儿目录清理
         clean_orphan_dirs "${remote}"
