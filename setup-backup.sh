@@ -99,34 +99,66 @@ fi
 # ============================================
 step "第一步：检测 rclone"
 
-if command -v rclone &> /dev/null; then
-    info "rclone 已安装: $(rclone version | head -1)"
-else
-    warn "未检测到 rclone，开始安装..."
-    if command -v apt-get &> /dev/null; then
-        apt-get update -qq
-        apt-get install -y rclone
-    elif command -v yum &> /dev/null; then
-        yum install -y epel-release
-        yum install -y rclone
-    elif command -v dnf &> /dev/null; then
-        dnf install -y epel-release
-        dnf install -y rclone
-    else
-        error "未检测到支持的包管理器，请手动安装 rclone"
-        exit 1
+# 安装最新版 rclone（二进制方式，版本高于 apt/yum 源）
+install_rclone() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64)  arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7l|armhf)  arch="arm" ;;
+        *) error "不支持的架构: $arch"; exit 1 ;;
+    esac
+
+    local url="https://downloads.rclone.org/rclone-current-linux-${arch}.zip"
+    info "下载 rclone ($arch)..."
+    if ! wget -q --show-progress "$url" -O /tmp/rclone-install.zip 2>/dev/null; then
+        warn "下载失败，尝试包管理器安装..."
+        if command -v apt-get &> /dev/null; then
+            apt-get update -qq && apt-get install -y rclone
+        elif command -v yum &> /dev/null; then
+            yum install -y epel-release && yum install -y rclone
+        elif command -v dnf &> /dev/null; then
+            dnf install -y epel-release && dnf install -y rclone
+        else
+            error "安装失败，请手动安装: https://rclone.org/downloads/"
+            exit 1
+        fi
+        return
     fi
+
+    unzip -o /tmp/rclone-install.zip -d /tmp/rclone-install > /dev/null
+    cp /tmp/rclone-install/rclone-*/rclone /usr/bin/rclone
+    chmod +x /usr/bin/rclone
+    rm -rf /tmp/rclone-install /tmp/rclone-install.zip
+}
+
+if command -v rclone &> /dev/null; then
+    _rclone_ver=$(rclone version 2>/dev/null | head -1 | awk '{print $2}')
+    _rclone_num=${_rclone_ver#v}
+    _rclone_major=${_rclone_num%%.*}
+    _rclone_rest=${_rclone_num#*.}
+    _rclone_minor=${_rclone_rest%%.*}
+    # 检查版本是否低于 v1.55（不支持 config reconnect）
+    if [ "${_rclone_major}" -lt 1 ] 2>/dev/null || \
+       { [ "${_rclone_major}" -eq 1 ] && [ "${_rclone_minor}" -lt 55 ]; } 2>/dev/null; then
+        warn "rclone 版本 ${_rclone_ver} 过旧，升级到最新版..."
+        install_rclone
+        info "rclone 已升级: $(rclone version | head -1)"
+    else
+        info "rclone 已安装: $(rclone version | head -1)"
+    fi
+else
+    warn "未检测到 rclone，安装最新版..."
+    install_rclone
     if command -v rclone &> /dev/null; then
         info "rclone 安装成功: $(rclone version | head -1)"
     else
-        error "安装后仍无法找到 rclone，请手动安装后重新运行"
+        error "安装失败，请手动安装: https://rclone.org/downloads/"
         exit 1
     fi
 fi
 
-# ============================================
-#  第二步：检查 rclone 远程配置
-# ============================================
 step "第二步：检查 rclone 远程配置"
 
 REMOTES=$(rclone listremotes 2>/dev/null || true)
@@ -1006,6 +1038,22 @@ log "  保留: RETENTION_DISPLAY_PLACEHOLDER"
 log "========================================"
 
 acquire_lock
+
+# 预刷新远程 Token（防止长时间压缩后 Token 过期）
+# rclone config reconnect 需要 v1.55+，旧版本跳过
+_rclone_ver=$(rclone version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+_rclone_major=${_rclone_ver%%.*}
+_rclone_minor=${_rclone_ver#*.}
+if [ "${_rclone_major}" -ge 1 ] && [ "${_rclone_minor}" -ge 55 ] 2>/dev/null; then
+    for _remote in "${REMOTE_LIST[@]}"; do
+        _remote_name="${_remote%%:*}"
+        log "  → 刷新 ${_remote_name} 授权..."
+        rclone config reconnect "${_remote_name}" --auto-confirm 2>>"${LOG_FILE}" || \
+            log "  ⚠ 刷新失败（可能需要手动授权: rclone config reconnect ${_remote_name}）"
+    done
+else
+    log "  ℹ rclone 版本 $(rclone version 2>/dev/null | head -1 | awk '{print $2}') 较旧，跳过 Token 预刷新"
+fi
 
 # 前置钩子
 if [ -n "${PRE_BACKUP_CMD}" ]; then
