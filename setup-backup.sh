@@ -192,26 +192,26 @@ load_existing_config() {
             || true
     }
 
-    _get_items() {
-        sed -n '/^BACKUP_ITEMS=(/,/^)/p' "$script" 2>/dev/null \
-            | grep -oE '"[^"]*"' \
-            | sed 's/"//g' \
-            || true
+    _get_array() {
+        local name="$1"
+        # 提取数组内容：找到 NAME=( 到最近的 ) 之间的引号字符串
+        # 兼容旧版和新版脚本格式
+        python3 -c "
+import re, sys
+with open(sys.argv[1]) as f:
+    c = f.read()
+# 找到数组定义：NAME=( ... )
+m = re.search(r'(?m)^\s*' + re.escape(sys.argv[2]) + r'=\(([^)]*)\)', c)
+if m:
+    items = re.findall(r'\"([^\"]*)\"', m.group(1))
+    for item in items:
+        print(item)
+" "$script" "$name" 2>/dev/null || true
     }
 
-    _get_excludes() {
-        sed -n '/^EXCLUDE_PATTERNS=(/,/^)/p' "$script" 2>/dev/null \
-            | grep -oE '"[^"]*"' \
-            | sed 's/"//g' \
-            || true
-    }
-
-    _get_remotes() {
-        sed -n '/^REMOTE_LIST=(/,/^)/p' "$script" 2>/dev/null \
-            | grep -oE '"[^"]*"' \
-            | sed 's/"//g' \
-            || true
-    }
+    _get_items()   { _get_array "BACKUP_ITEMS"; }
+    _get_excludes(){ _get_array "EXCLUDE_PATTERNS"; }
+    _get_remotes() { _get_array "REMOTE_LIST"; }
 
     EXISTING_RETENTION_TYPE=$(_get_val "RETENTION_TYPE")
     EXISTING_RETENTION_COUNT=$(_get_val "RETENTION_COUNT")
@@ -1022,43 +1022,55 @@ SCRIPT_EOF
 
 # ---------- 替换占位符 ----------
 
-escape_for_sed() {
-    local s="$1" delim="${2:-/}"
-    s="${s//\\/\\\\}"
-    s="${s//${delim}/\\${delim}}"
-    s="${s//&/\\&}"
-    echo "$s"
-}
+# 用 Python 做占位符替换（兼容各种字符编码）
+# 第一步：替换不含特殊字符的简单值
+sed -i "s/PROJECT_NAME_PLACEHOLDER/${INPUT_PROJECT_NAME}/g" "$SCRIPT_PATH"
+sed -i "s/RETENTION_TYPE_PLACEHOLDER/${INPUT_RETENTION_TYPE}/g" "$SCRIPT_PATH"
+sed -i "s/RETENTION_COUNT_PLACEHOLDER/${INPUT_RETENTION_COUNT}/g" "$SCRIPT_PATH"
+sed -i "s/RETENTION_DAYS_PLACEHOLDER/${INPUT_RETENTION_DAYS}/g" "$SCRIPT_PATH"
+sed -i "s/COMPRESSION_LEVEL_PLACEHOLDER/${INPUT_COMPRESSION}/g" "$SCRIPT_PATH"
+sed -i "s/ENABLE_LOCK_PLACEHOLDER/${INPUT_LOCK}/g" "$SCRIPT_PATH"
+sed -i "s/RETRY_COUNT_PLACEHOLDER/${INPUT_RETRY_COUNT}/g" "$SCRIPT_PATH"
+sed -i "s/LOG_RETENTION_DAYS_PLACEHOLDER/${INPUT_LOG_RETENTION_DAYS}/g" "$SCRIPT_PATH"
 
-# 统一用 § 作为 sed 分隔符
-sed -i "s§PROJECT_NAME_PLACEHOLDER§$(escape_for_sed "${INPUT_PROJECT_NAME}" '§')§g" "$SCRIPT_PATH"
-sed -i "s§RETENTION_TYPE_PLACEHOLDER§$(escape_for_sed "${INPUT_RETENTION_TYPE}" '§')§g" "$SCRIPT_PATH"
-sed -i "s§RETENTION_COUNT_PLACEHOLDER§${INPUT_RETENTION_COUNT}§g" "$SCRIPT_PATH"
-sed -i "s§RETENTION_DAYS_PLACEHOLDER§${INPUT_RETENTION_DAYS}§g" "$SCRIPT_PATH"
-sed -i "s§COMPRESSION_LEVEL_PLACEHOLDER§${INPUT_COMPRESSION}§g" "$SCRIPT_PATH"
-sed -i "s§ENABLE_LOCK_PLACEHOLDER§${INPUT_LOCK}§g" "$SCRIPT_PATH"
-sed -i "s§RETRY_COUNT_PLACEHOLDER§${INPUT_RETRY_COUNT}§g" "$SCRIPT_PATH"
-sed -i "s§WEBHOOK_URL_PLACEHOLDER§$(escape_for_sed "${INPUT_WEBHOOK_URL}" '§')§g" "$SCRIPT_PATH"
-sed -i "s§BWLIMIT_PLACEHOLDER§$(escape_for_sed "${INPUT_BWLIMIT}" '§')§g" "$SCRIPT_PATH"
-sed -i "s§LOG_RETENTION_DAYS_PLACEHOLDER§${INPUT_LOG_RETENTION_DAYS}§g" "$SCRIPT_PATH"
-sed -i "s§LOG_DIR_PLACEHOLDER§$(escape_for_sed "${INPUT_LOG_DIR}" '§')§g" "$SCRIPT_PATH"
-sed -i "s§RETENTION_DISPLAY_PLACEHOLDER§$(escape_for_sed "${RETENTION_DISPLAY}" '§')§g" "$SCRIPT_PATH"
-sed -i "s§STATUS_PROJECT_DISPLAY§$(escape_for_sed "${INPUT_PROJECT_NAME}" '§')§g" "$SCRIPT_PATH"
-sed -i "s§PRE_BACKUP_CMD_PLACEHOLDER§$(escape_for_sed "${INPUT_PRE_CMD}" '§')§g" "$SCRIPT_PATH"
-sed -i "s§POST_BACKUP_CMD_PLACEHOLDER§$(escape_for_sed "${INPUT_POST_CMD}" '§')§g" "$SCRIPT_PATH"
+# 第二步：含特殊字符的值用 Python 替换
+python3 - "$SCRIPT_PATH" "${INPUT_WEBHOOK_URL}" "${INPUT_BWLIMIT}" "${INPUT_LOG_DIR}" "${RETENTION_DISPLAY}" "${INPUT_PRE_CMD}" "${INPUT_POST_CMD}" "${INPUT_PROJECT_NAME}" << 'PYEOF_REPLACE'
+import sys
+filepath = sys.argv[1]
+with open(filepath, 'r') as f:
+    c = f.read()
+for k, v in [
+    ("WEBHOOK_URL_PLACEHOLDER", sys.argv[2]),
+    ("BWLIMIT_PLACEHOLDER", sys.argv[3]),
+    ("LOG_DIR_PLACEHOLDER", sys.argv[4]),
+    ("RETENTION_DISPLAY_PLACEHOLDER", sys.argv[5]),
+    ("PRE_BACKUP_CMD_PLACEHOLDER", sys.argv[6]),
+    ("POST_BACKUP_CMD_PLACEHOLDER", sys.argv[7]),
+    ("STATUS_PROJECT_DISPLAY", sys.argv[8]),
+]:
+    c = c.replace(k, v)
+with open(filepath, 'w') as f:
+    f.write(c)
+PYEOF_REPLACE
 
-# 替换数组占位符（用 awk）
-replace_array_placeholder() {
-    local placeholder="$1" content="$2" file="$3"
-    awk -v content="$content" -v ph="$placeholder" '
-    $0 == ph { print content; next }
-    { print }
-    ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
-}
-
-replace_array_placeholder "BACKUP_ITEMS_PLACEHOLDER" "$FOLDERS_ARRAY" "$SCRIPT_PATH"
-replace_array_placeholder "REMOTE_LIST_PLACEHOLDER" "$REMOTE_ARRAY" "$SCRIPT_PATH"
-replace_array_placeholder "EXCLUDE_PATTERNS_PLACEHOLDER" "$EXCLUDE_ARRAY" "$SCRIPT_PATH"
+# 第三步：数组占位符用 Python 替换
+export _PY_BACKUP_ITEMS="$FOLDERS_ARRAY"
+export _PY_REMOTE_LIST="$REMOTE_ARRAY"
+export _PY_EXCLUDES="$EXCLUDE_ARRAY"
+python3 - "$SCRIPT_PATH" << 'PYEOF_ARRAY'
+import sys, os
+filepath = sys.argv[1]
+with open(filepath, 'r') as f:
+    c = f.read()
+for env_key, ph in [
+    ("_PY_BACKUP_ITEMS", "BACKUP_ITEMS_PLACEHOLDER"),
+    ("_PY_REMOTE_LIST", "REMOTE_LIST_PLACEHOLDER"),
+    ("_PY_EXCLUDES", "EXCLUDE_PATTERNS_PLACEHOLDER"),
+]:
+    c = c.replace(ph, os.environ.get(env_key, ""))
+with open(filepath, 'w') as f:
+    f.write(c)
+PYEOF_ARRAY
 
 chmod +x "$SCRIPT_PATH"
 info "备份脚本已生成: ${SCRIPT_PATH}"
@@ -1210,10 +1222,17 @@ info "全部恢复完成！文件位于: ${RESTORE_DIR}"
 RESTORE_EOF
 
 # 替换恢复脚本占位符
-sed -i "s§PROJECT_NAME_PLACEHOLDER§$(escape_for_sed "${INPUT_PROJECT_NAME}" '§')§g" "$RESTORE_PATH"
-# 替换 REMOTE_LIST
-awk -v content="$REMOTE_ARRAY" '/^REMOTE_LIST_PLACEHOLDER$/ { print content; next } { print }' \
-    "$RESTORE_PATH" > "$RESTORE_PATH.tmp" && mv "$RESTORE_PATH.tmp" "$RESTORE_PATH"
+sed -i "s/PROJECT_NAME_PLACEHOLDER/${INPUT_PROJECT_NAME}/g" "$RESTORE_PATH"
+export _PY_REMOTE_LIST="$REMOTE_ARRAY"
+python3 - "$RESTORE_PATH" << 'PYEOF_RESTORE'
+import sys, os
+filepath = sys.argv[1]
+with open(filepath, 'r') as f:
+    c = f.read()
+c = c.replace("REMOTE_LIST_PLACEHOLDER", os.environ.get("_PY_REMOTE_LIST", ""))
+with open(filepath, 'w') as f:
+    f.write(c)
+PYEOF_RESTORE
 
 chmod +x "$RESTORE_PATH"
 info "恢复脚本已生成: ${RESTORE_PATH}"
