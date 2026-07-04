@@ -88,3 +88,58 @@ wget https://raw.githubusercontent.com/nsv2051/scripts/main/systool.sh
 chmod +x systool.sh
 sudo ./systool.sh
 ```
+# Linux 远程自动备份
+
+基于 rclone 的交互式远程备份工具，支持 40+ 云存储平台，一键配置定时备份。
+
+## 功能
+
+- 多远程异地备份（同时备份到多个云盘）
+- 通配符支持（`/root/*.sh` 每个文件独立备份）
+- 前置/后置钩子（如 `mysqldump` 备份数据库）
+- 排除规则、网络重试、孤儿目录清理
+- 按数量/天数自动清理旧备份
+- 自动生成恢复脚本，交互式选择版本恢复
+- 配置持久化（重新运行自动读取旧配置）
+- Webhook 通知（钉钉、飞书等）
+- 卸载功能
+
+## 使用
+
+```bash
+# 一键运行
+curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/setup-backup.sh -o /tmp/setup-backup.sh && bash /tmp/setup-backup.sh
+
+# 国内代理
+curl -fsSL https://gitproxy.eu.org/https://raw.githubusercontent.com/nsv2051/scripts/main/setup-backup.sh -o /tmp/setup-backup.sh && bash /tmp/setup-backup.sh
+
+# 卸载
+bash /opt/remote-backup/setup-backup.sh --uninstall
+```
+
+## 生成的文件
+
+```
+/opt/remote-backup/
+├── {项目名}.sh            # 备份脚本（顶部可编辑配置区直接改）
+└── restore-{项目名}.sh    # 恢复脚本
+
+/var/log/remote-backup/    # 按天滚动日志
+/var/run/{项目名}.lock     # 锁文件
+```
+
+## 常用命令
+
+```bash
+# 手动备份
+/opt/remote-backup/项目名.sh
+
+# 恢复数据
+/opt/remote-backup/restore-项目名.sh
+
+# 查看日志
+tail -f /var/log/remote-backup/项目名-$(date +%Y%m%d).log
+
+# 重新配置（自动读取旧配置，回车保留）
+bash /opt/remote-backup/setup-backup.sh
+```
