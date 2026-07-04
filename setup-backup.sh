@@ -1039,21 +1039,16 @@ log "========================================"
 
 acquire_lock
 
-# 预刷新远程 Token（防止长时间压缩后 Token 过期）
-# rclone config reconnect 需要 v1.55+，旧版本跳过
-_rclone_ver=$(rclone version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
-_rclone_major=${_rclone_ver%%.*}
-_rclone_minor=${_rclone_ver#*.}
-if [ "${_rclone_major}" -ge 1 ] && [ "${_rclone_minor}" -ge 55 ] 2>/dev/null; then
-    for _remote in "${REMOTE_LIST[@]}"; do
-        _remote_name="${_remote%%:*}"
-        log "  → 刷新 ${_remote_name} 授权..."
-        rclone config reconnect "${_remote_name}" --auto-confirm 2>>"${LOG_FILE}" || \
-            log "  ⚠ 刷新失败（可能需要手动授权: rclone config reconnect ${_remote_name}）"
-    done
-else
-    log "  ℹ rclone 版本 $(rclone version 2>/dev/null | head -1 | awk '{print $2}') 较旧，跳过 Token 预刷新"
-fi
+# 连通性检查
+for _remote in "${REMOTE_LIST[@]}"; do
+    _remote_name="${_remote%%:*}"
+    if ! rclone about "${_remote_name}:" > /dev/null 2>&1; then
+        log "  ✗ 无法连接 ${_remote_name}，请检查授权"
+        release_lock
+        send_notification "[失败] ${STATUS_PROJECT}" "主机 ${HOSTNAME}: 无法连接 ${_remote_name}"
+        exit 1
+    fi
+done
 
 # 前置钩子
 if [ -n "${PRE_BACKUP_CMD}" ]; then
