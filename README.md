@@ -4,31 +4,42 @@
  ```
 # Time Sync Script
 
-这是一个用于设置系统时区并同步时间的 shell 脚本，适用于多种 Linux 系统。它将时区设置为 `Asia/Shanghai`，并通过 `ntpdate` 从 `pool.ntp.org` 同步时间，同时设置每小时自动同步的 cron 任务。
+用于设置系统时区并校准系统时间的生产级脚本（v2.0），适用于 Debian/Ubuntu、RHEL 系、openSUSE、Arch 等发行版。默认时区 `Asia/Shanghai`，默认 NTP 服务器 `ntp.aliyun.com`。
 
 ## 功能
-- 设置系统时区为 `Asia/Shanghai`
-- 检查并自动安装 `ntpdate`（支持 `apt`、`yum`、`dnf`、`pacman`）
-- 立即同步系统时间
-- 添加每小时第 1 分钟自动同步时间的 cron 任务
+- **守护进程优先**：检测到 chrony / systemd-timesyncd / ntpd 正在运行时，交给守护进程校时，不调用 `ntpdate` 步进时钟
+- **偏差自检**：同步后读取实际 NTP 偏差，超过 2 秒明确告警并以非 0 退出，不再只看本地 `date`
+- **cron 绝对路径**：写入 `/usr/sbin/ntpdate`（或实际探测到的绝对路径），避免 cron 默认 PATH 找不到命令而静默失败
+- **幂等**：通过唯一标记注释去重，重跑不会产生重复 cron 行，并清理旧版写坏的裸 `ntpdate` 行
+- **可卸载**：`--uninstall` 只删除本脚本写入的行，保留用户自己的 crontab
+- 支持 `--dry-run` 干跑、`--check` 只读自检、`--no-cron`、自定义时区与多服务器
 
-## 前提条件
-- 需要 root 权限运行（建议使用 `sudo`）
-- 需要网络连接以安装依赖和同步时间
+## 参数
+| 参数 | 说明 |
+|---|---|
+| `-t, --tz <时区>` | 时区，默认 `Asia/Shanghai`，写入前校验 `/usr/share/zoneinfo/<时区>` |
+| `-s, --server <主机>` | NTP 服务器，默认 `ntp.aliyun.com`，可重复指定，按顺序尝试 |
+| `--dry-run` | 只检测并打印将执行的动作，不写文件、不改时钟、不装包、不碰 crontab |
+| `--check` | 只读检测时区、同步状态、NTP 偏差、守护进程和 cron 行；正常退出 0，否则 1 |
+| `--uninstall` | 只删除本脚本写入的 cron 行，不改系统时区、不卸载软件包 |
+| `--no-cron` | 不写 crontab（适合已有其它校时机制的机器） |
+| `-h, --help` | 显示帮助 |
 
-## 使用方法
+## 一键执行（推荐）
+通过 `curl` 或 `wget` 从 GitHub 下载并运行：
 
-### 一键执行（推荐）
-通过 `curl` 或 `wget` 直接从 GitHub 下载并运行脚本：
-
-#### 使用 curl
 ```bash
+# 默认安装（curl）
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/sync-time.sh)"
-```
-#### 使用 wget
-```bash
+
+# 默认安装（wget）
 bash -c "$(wget -qO- https://raw.githubusercontent.com/nsv2051/scripts/main/sync-time.sh)"
+
+# 只读自检（curl，传参示例）
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/sync-time.sh)" -- --check
 ```
+
+> 若机器已有 chrony 或 systemd-timesyncd，本脚本不会写 cron，也不会步进时钟，只让守护进程自行校时。
 # mtg一键
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/automtg.sh)
