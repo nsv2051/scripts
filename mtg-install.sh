@@ -56,6 +56,13 @@ done
 
 [[ $EUID -eq 0 ]] || die "需要 root 权限运行"
 
+# ---------- 参数合法性（防止配置注入与畸形值） ----------
+# 域名只允许标准主机名；grep 字符串会写进 TOML，不校验可被引号逃逸篡改配置
+if ! [[ "$FRONT_DOMAIN" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; then
+  die "前端域名不合法: ${FRONT_DOMAIN}（需形如 www.example.com）"
+fi
+(( ${#FRONT_DOMAIN} <= 253 )) || die "域名过长"
+
 # ---------- 工具函数 ----------
 port_in_use() {
   local p="$1"
@@ -73,8 +80,10 @@ port_owned_by_mtg() {
 }
 
 # 取公网 IP：多源回退，避免单点失败导致链接残缺
+# 优先 IPv4；本脚本 bind-to 用 0.0.0.0（仅 IPv4），
+# 纯 IPv6 机器不能默默给出坏链接，必须显式声明。
 get_public_ip() {
-  local ip
+  local ip url
   for url in https://api.ipify.org https://ifconfig.me/ip https://ip.sb https://icanhazip.com; do
     ip="$(curl -fsS --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]')" || continue
     if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
@@ -100,7 +109,8 @@ show_links() {
 
   ip="$(get_public_ip || true)"
   if [[ -z "$ip" ]]; then
-    warn "公网 IP 获取失败，请手动填入服务器 IP"
+    warn "未取到公网 IPv4。本脚本监听 0.0.0.0（仅 IPv4），"
+    warn "若该机仅有 IPv6，需自行把 bind-to 改为 \"[::]:${port}\" 并手动填链接。"
     ip="<你的服务器IP>"
   fi
 
@@ -216,7 +226,10 @@ fi
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
 info "下载 mtg v${MTG_VERSION}"
-curl -fsSL --retry 3 --connect-timeout 15 -o "${TMP}/${TARBALL}" "$URL" \
+# --proto '=https' 禁止重定向降级到 http（跟随时可能被中间人换成明文/虚假 URL）
+curl -fsSL --proto '=https' --proto-redir '=https' \
+  --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 \
+  -o "${TMP}/${TARBALL}" "$URL" \
   || die "下载失败: $URL"
 
 info "校验 SHA-256"
@@ -298,6 +311,9 @@ Description=mtg - MTProto proxy
 Documentation=https://github.com/9seconds/mtg
 After=network-online.target
 Wants=network-online.target
+# StartLimit* 属于 [Unit] 段；写进 [Service] 会被 systemd 忽略
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
