@@ -79,6 +79,27 @@ port_owned_by_mtg() {
   ss -lntpH 2>/dev/null | awk -v port="$p" '$4 ~ ("[:.]" port "$")' | grep -q '"mtg"'
 }
 
+
+# 防火檧自检：仅提示，不自动改规则（擅改 iptables 风险更高）
+firewall_hint() {
+  local port="$1"
+  command -v iptables >/dev/null 2>&1 || return 0
+
+  # 1Panel 风格：ACCEPT 白名单 + 末尾 DROP，未放行的端口会被直接丢弃
+  if iptables -L 1PANEL_BASIC -n >/dev/null 2>&1; then
+    if iptables -L 1PANEL_BASIC -n 2>/dev/null | grep -qE "dpt:${port}( |\$)"; then
+      info "防火墙：1Panel 已放行 tcp/${port}"
+    else
+      warn "防火墙：1Panel 未放行 tcp/${port}，外部将连不上！"
+      warn "  请在 1Panel → 主机 → 防火墙 添加放行规则：tcp/${port}"
+      warn "  （本机 iptables 末尾有 DROP，未放行端口一律丢弃）"
+    fi
+  fi
+
+  # 云厂商安全组（OCI/AWS/阿里云）在主机之外还有一层，脚本无法探测
+  warn "云服务器还需在控制台安全组放行 tcp/${port}，否则同样连不上"
+}
+
 # 取公网 IP：多源回退，避免单点失败导致链接残缺
 # 优先 IPv4；本脚本 bind-to 用 0.0.0.0（仅 IPv4），
 # 纯 IPv6 机器不能默默给出坏链接，必须显式声明。
@@ -360,6 +381,7 @@ if [[ $OK -ne 1 ]]; then
   die "mtg 启动失败"
 fi
 info "服务已启动并在 ${LISTEN_PORT} 监听"
+firewall_hint "$LISTEN_PORT"
 
 # ---------- 7. 输出 ----------
 show_links
