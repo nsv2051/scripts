@@ -11,7 +11,7 @@
 set -uo pipefail
 
 VERSION="1.0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" >/dev/null 2>&1 && pwd || true)"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/nsv2051/scripts/main}"
 RAW_PROXY="${RAW_PROXY:-https://gitproxy.eu.org}"
 QCS_URL="${QCS_URL:-https://ssh.nnn.cx/sh}"
