@@ -11,6 +11,7 @@ set -euo pipefail
 TZ_NAME="Asia/Shanghai"; declare -a SERVERS=("ntp.aliyun.com") USABLE=()
 DRY_RUN=0; MODE="install"; NO_CRON=0; SERVER_OVERRIDE=0
 MARKER="# sync-time.sh: auto sync (managed by nsv2051/scripts)"
+TZ_RAW=""
 NTPDATE_BIN=""; DAEMON=""; PM=""; CRON_SERVER=""
 info() { printf '\033[32m[*]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[!]\033[0m %s\n' "$*"; }
@@ -28,7 +29,10 @@ while [[ $# -gt 0 ]]; do
     *) die "未知参数: $1（-h 查看用法）" ;;
   esac
 done
-[[ -n "$TZ_NAME" && -f "/usr/share/zoneinfo/$TZ_NAME" ]] || die "无效时区: $TZ_NAME"
+TZ_RAW="$TZ_NAME"
+TZ_PATH="$(readlink -f "/usr/share/zoneinfo/$TZ_NAME" 2>/dev/null || true)"
+[[ -n "$TZ_NAME" && -n "$TZ_PATH" && "$TZ_PATH" == /usr/share/zoneinfo/* ]] || die "无效时区: $TZ_RAW"
+TZ_NAME="${TZ_PATH#/usr/share/zoneinfo/}"
 detect_pm() {
   local c
   PM=""
@@ -70,7 +74,7 @@ chrony_offset() {
 }
 # ntpdate -q 的偏移量是第 4 字段，输出里没有 "offset" 字样，不能按词匹配
 ntpdate_field_offset() {
-  awk '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ && $4 ~ /^-?[0-9]+(\.[0-9]+)?$/ { print $4; exit }'
+  awk '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ && $4 ~ /^[+-]?[0-9]+(\.[0-9]+)?$/ { print $4; exit }'
 }
 ntpdate_offset() {
   local bin s out raw
@@ -119,6 +123,7 @@ handle_daemon() {
   esac
   info "等待校时收敛（最多 15 秒）"
   if wait_for_sync; then info "守护进程已确认同步"; else warn "15 秒内未确认同步，可稍后运行 --check"; fi
+  cleanup_legacy_cron
   info "守护进程本身就在校时，跳过 crontab 以避免与其抢时钟"
 }
 ensure_ntpdate() {
@@ -192,11 +197,11 @@ cron_line_exists() {
   [[ "$tab" == *"$MARKER"* ]]
 }
 write_cron() {
-  local server="$1" min hour line current filtered
-  min=$((RANDOM % 60)); hour=$((RANDOM % 24))
-  line="${min} ${hour} * * * ${NTPDATE_BIN} -u -s ${server} >/dev/null 2>&1"
+  local server="$1" min line current filtered
+  min=$((RANDOM % 60))
+  line="${min} * * * * ${NTPDATE_BIN} -u -s ${server} >/dev/null 2>&1"
   if (( DRY_RUN )); then info "[dry-run] 将执行: 写入 crontab: $line"; return 0; fi
-  command -v crontab >/dev/null 2>&1 || { warn "未找到 crontab，跳过写入"; return 1; }
+  command -v crontab >/dev/null 2>&1 || { warn "未找到 crontab，跳过写入（时间同步本身已完成）"; return 0; }
   current="$(crontab -l 2>/dev/null || true)"; filtered=""
   if [[ -n "$current" ]]; then filtered="$(strip_managed "$current" 1)"; fi
   if [[ -n "$filtered" ]]; then { printf '%s\n' "$filtered"; printf '%s\n%s\n' "$MARKER" "$line"; } | crontab -
@@ -214,6 +219,23 @@ uninstall_cron() {
   if [[ -n "$filtered" ]]; then printf '%s\n' "$filtered" | crontab -; else crontab -r 2>/dev/null || true; fi
   info "已删除 sync-time 写入的 cron 行"
 }
+
+# 守护进程分支不写 cron，但仍要清掉旧版 v1 留下的坏行，否则用户跑完等于没修
+cleanup_legacy_cron() {
+  local current filtered
+  command -v crontab >/dev/null 2>&1 || return 0
+  current="$(crontab -l 2>/dev/null || true)"
+  [[ -n "$current" ]] || return 0
+  filtered="$(strip_managed "$current" 1)"
+  [[ "$filtered" == "$current" ]] && return 0
+  if (( NO_CRON )); then
+    warn "检测到旧版写坏的 sync-time cron 行；--no-cron 下不改动 crontab，可运行 --uninstall 或手动删除"
+    return 0
+  fi
+  if [[ -n "$filtered" ]]; then printf '%s\n' "$filtered" | crontab -; else crontab -r 2>/dev/null || true; fi
+  info "已清理旧版 sync-time 写入的 cron 行（cron 默认 PATH 找不到 /usr/sbin/ntpdate）"
+}
+
 do_check() {
   local cur off synced="no" tz_ok=0 svc="无" rc=1
   cur="$(readlink -f /etc/localtime 2>/dev/null || true)"
@@ -237,14 +259,18 @@ print_summary() {
   cur="$(readlink -f /etc/localtime 2>/dev/null || true)"
   distro="$(awk -F= '/^PRETTY_NAME=/{sub(/^PRETTY_NAME=/,""); gsub(/"/,""); print; exit}' /etc/os-release 2>/dev/null || true)"
   [[ -n "$distro" ]] || distro="$(uname -s)"
-  np="${NTPDATE_BIN:-未安装（将自动安装）}"
+  np="${NTPDATE_BIN:-$(command -v ntpdate 2>/dev/null || true)}"
+  np="${np:-未安装（将自动安装）}"
   info "环境摘要"
   if [[ ${EUID} -eq 0 ]]; then info "  root: yes"; else info "  root: no"; fi
   info "  时区: $TZ_NAME -> ${cur:-未设置}"; info "  distro: $distro"; info "  包管理器: ${PM:-无}"; info "  ntpdate: $np"; info "  守护进程: ${DAEMON:-无}"
 }
 detect_pm
 if [[ "$MODE" == check ]]; then rc=0; do_check || rc=$?; exit "$rc"; fi
-if [[ "$MODE" == uninstall ]]; then [[ ${EUID} -eq 0 ]] || die "需要 root 权限运行（sudo）"; uninstall_cron; exit 0; fi
+if [[ "$MODE" == uninstall ]]; then
+  if (( DRY_RUN )); then info "[dry-run] 将执行: 删除 sync-time 写入的 crontab 行，不动其它条目"; exit 0; fi
+  [[ ${EUID} -eq 0 ]] || die "需要 root 权限运行（sudo）"; uninstall_cron; exit 0
+fi
 if (( ! DRY_RUN )); then [[ ${EUID} -eq 0 ]] || die "需要 root 权限运行（sudo）"; fi
 apply_timezone
 detect_daemon
