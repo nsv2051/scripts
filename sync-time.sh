@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# sync-time.sh v2.0 —— 时区设置 + 时间同步
+# sync-time.sh v2.2 —— 时区设置 + 时间同步
 # 用法: bash sync-time.sh [-t 时区] [-s 服务器]... [--dry-run] [--no-cron]
 #       bash sync-time.sh --check | --uninstall | -h
 # 参数: -t/--tz 时区(默认 Asia/Shanghai)  -s/--server 服务器(可重复)
@@ -8,7 +8,7 @@
 #       --no-cron 不写 crontab  -h/--help 帮助
 # ============================================================
 set -euo pipefail
-TZ_NAME="Asia/Shanghai"; declare -a SERVERS=("ntp.aliyun.com") USABLE=()
+TZ_NAME="Asia/Shanghai"; declare -a SERVERS=("ntp.aliyun.com" "ntp.tencent.com") USABLE=()
 DRY_RUN=0; MODE="install"; NO_CRON=0; SERVER_OVERRIDE=0
 MARKER="# sync-time.sh: auto sync (managed by nsv2051/scripts)"
 TZ_RAW=""
@@ -76,6 +76,18 @@ chrony_offset() {
 ntpdate_field_offset() {
   awk '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ && $4 ~ /^[+-]?[0-9]+(\.[0-9]+)?$/ { print $4; exit }'
 }
+
+# 单次 -q 查询偶发 "no eligible servers"（瞬时抖动），读不到偏差就重试，最多 3 次
+read_offset_retry() {
+  local s="$1" i off
+  for i in 1 2 3; do
+    off="$("$NTPDATE_BIN" -q "$s" 2>/dev/null | ntpdate_field_offset || true)"
+    if [[ -n "$off" ]]; then printf '%s' "$off"; return 0; fi
+    if (( i < 3 )); then warn "读取偏差失败（第 ${i} 次），2 秒后重试" >&2; sleep 2; fi
+  done
+  return 1
+}
+
 ntpdate_offset() {
   local bin s out raw
   bin="$(command -v ntpdate 2>/dev/null || true)"
@@ -177,8 +189,8 @@ do_sync() {
     warn "与 $s 同步失败，尝试下一个"
   done
   (( synced == 1 )) || die "所有 NTP 服务器同步失败"
-  off="$("$NTPDATE_BIN" -q "$CRON_SERVER" 2>/dev/null | ntpdate_field_offset || true)"
-  if [[ -z "$off" ]]; then warn "同步后无法读取偏差"; return 1; fi
+  off="$(read_offset_retry "$CRON_SERVER" || true)"
+  if [[ -z "$off" ]]; then warn "同步后无法读取偏差（已尝试 3 次，服务器可能限流）"; return 1; fi
   if within_2s "$off"; then info "同步完成，偏差 ${off} 秒"; return 0; fi
   warn "同步后偏差仍为 ${off} 秒"; return 1
 }
