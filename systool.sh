@@ -370,13 +370,27 @@ enable_slaac_ipv6() {
     read -n 1 -s -r -p "按任意键继续..."
 }
 
+# 幂等写入 ini 风格键值：已存在则整行替换，否则插入 [Time] 后或追加
+set_conf_kv() {
+    local file="$1" key="$2" value="$3" esc
+    [ -f "$file" ] || return 1
+    esc=$(printf '%s' "$value" | sed 's/[\\|&]/\\&/g')
+    if grep -qE "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]*=" "$file"; then
+        sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]*=.*|${key}=${esc}|" "$file"
+    elif grep -qE '^[[:space:]]*\[Time\][[:space:]]*$' "$file"; then
+        sed -i -E "/^[[:space:]]*\[Time\][[:space:]]*$/a ${key}=${esc}" "$file"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+    fi
+}
+
 # 设置NTP自动校时服务器
 configure_ntp() {
     display_header
     check_root || return
 
     echo -e "${YELLOW}当前NTP服务器：${NC}"
-    timedatectl show-timesync | grep Server
+    timedatectl show-timesync 2>/dev/null | grep -E '^Server' || echo "（当前无活动的 NTP 服务器）"
 
     echo -e "\n${BLUE}NTP服务器选项：${NC}"
     echo "1) 阿里云NTP"
@@ -401,8 +415,8 @@ configure_ntp() {
     # 设置NTP
     timedatectl set-ntp true
     if [ -f "/etc/systemd/timesyncd.conf" ]; then
-        sed -i "s/^#NTP=/NTP=$ntp/" /etc/systemd/timesyncd.conf
-        sed -i "s/^#FallbackNTP=/FallbackNTP=ntp.ubuntu.com/" /etc/systemd/timesyncd.conf
+        set_conf_kv /etc/systemd/timesyncd.conf NTP "$ntp"
+        set_conf_kv /etc/systemd/timesyncd.conf FallbackNTP "ntp.ubuntu.com"
         systemctl restart systemd-timesyncd
     else
         echo -e "${RED}未找到timesyncd.conf文件，可能需要手动配置${NC}"

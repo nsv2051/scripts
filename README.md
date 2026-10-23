@@ -1,7 +1,62 @@
 # 一键设置密钥登陆
- ```
- curl -s https://gitproxy.eu.org/https://raw.githubusercontent.com/nsv2051/scripts/main/add_ssh_key.sh | bash
- ```
+
+本仓库不再维护 SSH 公钥部署脚本，统一使用 [quickly-conf-sshd](https://github.com/nsv2051/quickly-conf-sshd)：
+
+```bash
+curl -s https://ssh.nnn.cx/sh | bash -s -- -c
+```
+
+详见该项目 README。
+
+# 统一入口 toolbox.sh
+
+一个入口覆盖本仓库全部工具：不带参数是交互菜单，带参数直达指定工具。
+
+```bash
+# 交互菜单
+bash <(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/toolbox.sh)
+
+# 国内网络不好时走加速通道
+bash <(curl -fsSL https://gitproxy.eu.org/https://raw.githubusercontent.com/nsv2051/scripts/main/toolbox.sh)
+```
+
+## 用法
+
+| 命令 | 说明 |
+| --- | --- |
+| `bash toolbox.sh` | 交互菜单选择工具 |
+| `bash toolbox.sh -l` | 列出全部工具 |
+| `bash toolbox.sh -h` | 显示帮助 |
+| `bash toolbox.sh <id>` | 直接运行指定工具 |
+| `bash toolbox.sh <id> -- <参数>` | 运行并透传该工具的参数 |
+
+示例：
+
+```bash
+bash toolbox.sh syscard
+bash toolbox.sh synctime -- --check
+bash toolbox.sh mtg -- --dry-run
+bash toolbox.sh ssh -- -c "17 * * * *"
+```
+
+## 工具一览
+
+| id | 脚本 / 来源 | 说明 | root |
+| --- | --- | --- | --- |
+| `syscard` | `syscard.sh` | 系统信息快照（只读） | 否 |
+| `kworker` | `kworker-check.sh` | 挖矿/恶意进程检测 | 是 |
+| `systool` | `systool.sh` | 系统运维菜单（电源/源/DNS/磁盘/网络/CPU/NTP） | 是 |
+| `synctime` | `sync-time.sh` | 时区 + 时间同步 | 是 |
+| `mtg` | `mtg-install.sh` | mtg MTProto 代理（原生二进制，校验 SHA-256） | 是 |
+| `automtg` | `automtg.sh` | mtg Docker 版一键（随机端口） | 是 |
+| `backup` | `setup-backup.sh` | 远程备份配置（rclone + cron） | 是 |
+| `ddns` | `ddns.sh` | Cloudflare DDNS 更新 | 否 |
+| `ssh` | `https://ssh.nnn.cx/sh` | SSH 公钥部署（qcs 项目） | 是 |
+
+> `ssh` 项直接调用 [quickly-conf-sshd](https://github.com/nsv2051/quickly-conf-sshd) 的线上脚本，参数原样透传给 qcs（如 `-o`、`-c`、`-P`）。本仓库 `backup/` 下的两个旧 SSH 脚本仅作存档。
+
+需要 root 的工具请用 `sudo bash toolbox.sh <id>`；工具箱不会自动提权。
+
 # Time Sync Script
 
 用于设置系统时区并校准系统时间的生产级脚本（v2.3），适用于 Debian/Ubuntu、RHEL 系、openSUSE、Arch 等发行版。默认时区 `Asia/Shanghai`，默认 NTP 服务器 `ntp.aliyun.com`、`ntp.tencent.com`、`time.cloudflare.com`（按顺序尝试，国内源优先、海外源兜底）。
