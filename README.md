@@ -4,12 +4,13 @@
  ```
 # Time Sync Script
 
-用于设置系统时区并校准系统时间的生产级脚本（v2.2），适用于 Debian/Ubuntu、RHEL 系、openSUSE、Arch 等发行版。默认时区 `Asia/Shanghai`，默认 NTP 服务器 `ntp.aliyun.com`、`ntp.tencent.com`（按顺序尝试）。
+用于设置系统时区并校准系统时间的生产级脚本（v2.3），适用于 Debian/Ubuntu、RHEL 系、openSUSE、Arch 等发行版。默认时区 `Asia/Shanghai`，默认 NTP 服务器 `ntp.aliyun.com`、`ntp.tencent.com`、`time.cloudflare.com`（按顺序尝试，国内源优先、海外源兜底）。
 
 ## 功能
 - **守护进程优先**：检测到 chrony / systemd-timesyncd / ntpd 正在运行时，交给守护进程校时，不调用 `ntpdate` 步进时钟
 - **偏差自检**：同步后读取实际 NTP 偏差，超过 2 秒明确告警并以非 0 退出，不再只看本地 `date`；读取失败自动重试 2 次，避免瞬时抖动误判
 - **cron 绝对路径**：写入 `/usr/sbin/ntpdate`（或实际探测到的绝对路径），避免 cron 默认 PATH 找不到命令而静默失败
+- **国内外多源**：默认按「国内优先、海外兜底」顺序尝试三个 NTP 源，海外机器前两个超时后自动落到 Cloudflare anycast
 - **每小时校时**：cron 排期为每小时一次（随机分钟错峰），缩短时钟漂移窗口
 - **幂等**：通过唯一标记注释去重，重跑不会产生重复 cron 行，并清理旧版写坏的裸 `ntpdate` 行
 - **可卸载**：`--uninstall` 只删除本脚本写入的行，保留用户自己的 crontab
@@ -19,7 +20,7 @@
 | 参数 | 说明 |
 |---|---|
 | `-t, --tz <时区>` | 时区，默认 `Asia/Shanghai`，写入前校验 `/usr/share/zoneinfo/<时区>` |
-| `-s, --server <主机>` | NTP 服务器，默认 `ntp.aliyun.com` 与 `ntp.tencent.com`，可重复指定；一旦使用本参数则整体覆盖默认列表，按顺序尝试 |
+| `-s, --server <主机>` | NTP 服务器，默认 `ntp.aliyun.com`、`ntp.tencent.com`、`time.cloudflare.com`，可重复指定；一旦使用本参数则整体覆盖默认列表，按顺序尝试 |
 | `--dry-run` | 只检测并打印将执行的动作，不写文件、不改时钟、不装包、不碰 crontab |
 | `--check` | 只读检测时区、同步状态、NTP 偏差、守护进程和 cron 行；正常退出 0，否则 1 |
 | `--uninstall` | 只删除本脚本写入的 cron 行，不改系统时区、不卸载软件包 |

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# sync-time.sh v2.2 —— 时区设置 + 时间同步
+# sync-time.sh v2.3 —— 时区设置 + 时间同步
 # 用法: bash sync-time.sh [-t 时区] [-s 服务器]... [--dry-run] [--no-cron]
 #       bash sync-time.sh --check | --uninstall | -h
 # 参数: -t/--tz 时区(默认 Asia/Shanghai)  -s/--server 服务器(可重复)
@@ -8,7 +8,7 @@
 #       --no-cron 不写 crontab  -h/--help 帮助
 # ============================================================
 set -euo pipefail
-TZ_NAME="Asia/Shanghai"; declare -a SERVERS=("ntp.aliyun.com" "ntp.tencent.com") USABLE=()
+TZ_NAME="Asia/Shanghai"; declare -a SERVERS=("ntp.aliyun.com" "ntp.tencent.com" "time.cloudflare.com") USABLE=()
 DRY_RUN=0; MODE="install"; NO_CRON=0; SERVER_OVERRIDE=0
 MARKER="# sync-time.sh: auto sync (managed by nsv2051/scripts)"
 TZ_RAW=""
