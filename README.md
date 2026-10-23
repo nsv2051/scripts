@@ -116,7 +116,34 @@ journalctl -u mtg -f        # 日志
 mtg access /etc/mtg.toml    # 重新生成连接链接
 mtg doctor /etc/mtg.toml    # 配置自检（验证域名可达、SNI-DNS 匹配）
 bash mtg-install.sh --show  # 同上，不需记 mtg 的用法
+bash mtg-install.sh --verify # 端到端验证（真正握手，见下）
 ```
+
+## 端到端验证（`--verify`）
+
+`systemctl is-active` 通过、端口在听，**都不能证明代理真的能用**。常见的假阳性有三种：
+
+- 防火墙 DROP 了端口 → 本机看服务正常，外面连不上
+- secret 与客户端不一致 → 服务跑着，握手全被拒
+- 上游 Telegram DC 不可达 → 服务接受连接，但转发不出去
+
+`--verify` 不看这些表面指标，而是真跑一遍完整链路：
+
+```
+FakeTLS ClientHello  →  HMAC 校验  →  obfuscated2 握手  →  MTProto req_pq  →  检查 resPQ
+```
+
+只有最后拿到 Telegram 返回的 `resPQ`（构造器 `0x05162463`）且 nonce 一致，才算通过：
+
+```
+[*] 端到端验证 1.2.3.4:443（FakeTLS 握手 + MTProto req_pq）
+  [v] FakeTLS 握手通过（记录：0x16 -> 0x14 -> 0x17）
+  [v] MTProto req_pq 通过（resPQ，nonce 一致）
+
+  结论：代理可用，已成功中继到 Telegram DC
+```
+
+依赖 `python3` 与 `pycryptodome`（`apt-get install -y python3-pycryptodome`）。缺依赖时脚本会明确提示并跳过，不会假装成功。
 
 ## 注意
 
@@ -124,7 +151,8 @@ bash mtg-install.sh --show  # 同上，不需记 mtg 的用法
 - 支持 `amd64` / `arm64`，其他架构会直接退出
 - 端口被其他服务占用时脚本会直接中止，不会装完起不来
 - 前端域名需真实可达，它只影响 TLS 握手的 SNI 伪装，不改变流量走向
-- 记得放行对应 tcp 端口
+- 记得放行对应 tcp 端口；**装完请跑一次 `--verify`**，别只看服务状态
+- 云厂商安全组是独立一层，只改 iptables/1Panel 不管用，两层都要放行
 # System Card - 系统信息快照工具
 
 一个轻量级的 Bash 脚本，用于快速生成美观的系统状态报告，帮助您一目了然地掌握服务器运行状况。

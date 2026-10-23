@@ -14,6 +14,7 @@
 #   bash mtg-install.sh --uninstall          # 卸载（保留配置文件）
 #   bash mtg-install.sh --uninstall --purge  # 卸载并删除配置
 #   bash mtg-install.sh --show               # 仅重新显示连接链接
+#   bash mtg-install.sh --verify             # 端到端握手验证（FakeTLS + MTProto）
 # ============================================================
 set -euo pipefail
 
@@ -21,7 +22,7 @@ MTG_VERSION="2.2.8"
 FRONT_DOMAIN="www.microsoft.com"
 LISTEN_PORT="443"
 DRY_RUN=0
-MODE="install"          # install | uninstall | show
+MODE="install"          # install | uninstall | show | verify
 PURGE=0
 BIN="/usr/local/bin/mtg"
 CONF="/etc/mtg.toml"
@@ -49,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --uninstall) MODE="uninstall"; shift ;;
     --purge)     PURGE=1; shift ;;
     --show)      MODE="show"; shift ;;
+    --verify)    MODE="verify"; shift ;;
     -h|--help)   usage; exit 0 ;;
     *) die "未知参数: $1（用 -h 查看用法）" ;;
   esac
@@ -152,10 +154,181 @@ show_links() {
   echo "=============================================="
 }
 
+# ---------- verify 模式：真握手，不看"服务起来了" ----------
+# 只有拿到 Telegram 的 resPQ 才算可用。服务 active + 端口监听都可能是假阳性。
+do_verify() {
+  local secret port ip
+  [[ -f "$BIN" ]] || die "未安装 mtg（$BIN 不存在）"
+  secret="$(extract_secret)" || true
+  [[ -n "$secret" ]] || die "无法从 $CONF 读取 secret"
+
+  port="$(sed -n 's/^[[:space:]]*bind-to[[:space:]]*=[[:space:]]*"[^"]*:\([0-9]*\)".*/\1/p' "$CONF" | head -1)"
+  [[ -n "$port" ]] || port="$LISTEN_PORT"
+
+  command -v python3 >/dev/null 2>&1 || {
+    warn "未找到 python3，跳过端到端验证"; return 2
+  }
+  python3 -c 'import Crypto' 2>/dev/null || {
+    warn "缺少 pycryptodome，跳过端到端验证"
+    warn "Debian/Ubuntu: apt-get install -y python3-pycryptodome"
+    warn "其它系统:      pip3 install pycryptodome"
+    return 2
+  }
+
+  ip="$(get_public_ip || true)"
+  [[ -n "$ip" ]] || ip="127.0.0.1"
+  info "端到端验证 ${ip}:${port}（FakeTLS 握手 + MTProto req_pq）"
+
+  MTG_SECRET="$secret" python3 - "$ip" "$port" <<'PYEOF'
+import os, sys, socket, struct, hmac, hashlib, time, base64
+from Crypto.Cipher import AES
+
+def die(msg):
+    print("  [x] " + msg)
+    sys.exit(1)
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+sec = os.environ.get("MTG_SECRET", "").strip()
+if not sec:
+    die("secret 为空")
+
+try:
+    raw = bytes.fromhex(sec)
+except ValueError:
+    raw = base64.urlsafe_b64decode(sec + "=" * (-len(sec) % 4))
+
+if not raw or raw[0] != 0xee:
+    die("secret 首字节不是 0xee（非 faketls 模式），本验证不支持")
+key = raw[1:17]
+sni = raw[17:].decode()
+
+def ctr(k, iv):
+    return AES.new(k, AES.MODE_CTR, nonce=b"", initial_value=int.from_bytes(iv, "big"))
+
+def client_hello():
+    n = sni.encode()
+    ext = (b"\x00\x00" + struct.pack(">H", 5 + len(n)) + struct.pack(">H", 3 + len(n))
+           + b"\x00" + struct.pack(">H", len(n)) + n)
+    body = (b"\x03\x03" + b"\x00" * 32 + b"\x20" + os.urandom(32)
+            + struct.pack(">H", 2) + b"\x13\x01" + b"\x01\x00"
+            + struct.pack(">H", len(ext)) + ext)
+    hs = b"\x01" + len(body).to_bytes(3, "big") + body
+    rec = b"\x16\x03\x01" + struct.pack(">H", len(hs)) + hs
+    d = hmac.new(key, rec, hashlib.sha256).digest()
+    ts = struct.pack("<I", int(time.time()))
+    rnd = d[:28] + bytes(a ^ b for a, b in zip(d[28:32], ts))
+    return rec[:11] + rnd + rec[43:]
+
+def obf_frame(dc=2):
+    while True:
+        f = bytearray(os.urandom(64))
+        if f[0] == 0xef:
+            continue
+        if bytes(f[0:4]) in (b"HEAD", b"POST", b"GET ", b"OPTI",
+                              b"\xdd\xdd\xdd\xdd", b"\xee\xee\xee\xee"):
+            continue
+        if f[4:8] == b"\x00\x00\x00\x00":
+            continue
+        break
+    f[56:60] = b"\xdd\xdd\xdd\xdd"
+    f[60:62] = struct.pack("<h", dc)
+    enc = ctr(hashlib.sha256(bytes(f[8:40]) + key).digest(), bytes(f[40:56]))
+    full = enc.encrypt(bytes(f))
+    wire = bytearray(f)
+    wire[56:64] = full[56:64]
+    rev = bytes(f[8:56])[::-1]
+    dec = ctr(hashlib.sha256(rev[:32] + key).digest(), rev[32:48])
+    return bytes(wire), enc, dec
+
+def rec_write(p):
+    return b"\x17\x03\x03" + struct.pack(">H", len(p)) + p
+
+def read_exact(s, n):
+    b = b""
+    while len(b) < n:
+        c = s.recv(n - len(b))
+        if not c:
+            raise EOFError("对端关闭连接")
+        b += c
+    return b
+
+def read_record(s):
+    h = read_exact(s, 5)
+    return h[0], read_exact(s, struct.unpack(">H", h[3:5])[0])
+
+try:
+    s = socket.create_connection((host, port), timeout=10)
+except OSError as e:
+    die("无法连接 %s:%d（%s）" % (host, port, e))
+s.settimeout(12)
+s.sendall(client_hello())
+
+types = []
+try:
+    for _ in range(8):
+        t, p = read_record(s)
+        types.append(hex(t))
+        if t == 0x17:
+            break
+except (EOFError, socket.timeout) as e:
+    die("FakeTLS 握手无响应（%s）— 多半是端口未放行或被中间设备重置" % type(e).__name__)
+
+if not types or types[0] != "0x16":
+    die("FakeTLS 被拒绝（首包 %s）— secret 或 SNI 与服务器不一致"
+        % (types[0] if types else "无"))
+print("  [v] FakeTLS 握手通过（记录：%s）" % " -> ".join(types))
+
+wire, enc, dec = obf_frame(2)
+s.sendall(rec_write(wire))
+nonce = os.urandom(16)
+mid = (int(time.time()) << 32) & ~3
+body = struct.pack("<I", 0xbe7e8ef1) + nonce
+payload = b"\x00" * 8 + struct.pack("<Q", mid) + struct.pack("<i", len(body)) + body
+s.sendall(rec_write(enc.encrypt(struct.pack("<i", len(payload)) + payload)))
+
+plain = b""
+deadline = time.time() + 15
+while time.time() < deadline and len(plain) < 4:
+    try:
+        t, p = read_record(s)
+    except (EOFError, socket.timeout):
+        break
+    if t == 0x17:
+        plain += dec.decrypt(p)
+s.close()
+
+if len(plain) < 4:
+    die("已连通代理，但未收到 Telegram 数据（上游 DC 不可达？）")
+
+ln = struct.unpack("<i", plain[:4])[0]
+if not (0 < ln <= len(plain) - 4):
+    die("响应分帧异常（长度 %d，实收 %d）" % (ln, len(plain) - 4))
+r = plain[4:4 + ln]
+if len(r) < 24:
+    die("响应过短（%d 字节）" % len(r))
+cons = struct.unpack("<I", r[20:24])[0]
+if cons != 0x05162463:
+    die("响应构造器异常 0x%08x（预期 resPQ）" % cons)
+print("  [v] MTProto req_pq 通过（resPQ，nonce %s）"
+      % ("一致" if r[24:40] == nonce else "不一致"))
+print()
+print("  结论：代理可用，已成功中继到 Telegram DC")
+sys.exit(0)
+PYEOF
+}
+
 # ---------- show 模式 ----------
 if [[ "$MODE" == "show" ]]; then
   show_links
   exit 0
+fi
+
+# ---------- verify 模式 ----------
+if [[ "$MODE" == "verify" ]]; then
+  rc=0
+  do_verify || rc=$?
+  exit "$rc"
 fi
 
 # ---------- uninstall 模式 ----------
