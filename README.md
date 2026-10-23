@@ -50,16 +50,22 @@ bash <(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/automtg
 | 下载校验 | 无 | 强制 SHA-256 |
 | 版本 | 跟随 `:2` 标签漂移 | 锁定 2.2.8 |
 | 运行用户 | root | 专用低权限用户 `mtg` |
+| secret 权限 | 644（全局可读） | 640 `root:mtg` |
+| 端口检测 | 无 | 有，占用则中止 |
+| 失败处理 | 继续执行 | `set -euo pipefail` |
+| 幂等重跑 | 每次重置 secret | 保留原 secret |
+| 卸载 | 无 | `--uninstall` |
 | 权限加固 | 无 | systemd 沙箱选项 |
-| secret 生成 | `--hex bing.com` | FakeTLS，域名可配 |
 
 ## 安全设计
 
 - 版本锁定，不跟随 latest 漂移
 - 下载后强制比对 SHA-256，不匹配立即中止且不落盘
 - 只从 GitHub Releases 下载，不经第三方镜像
-- secret 用 FakeTLS（`ee` 前缀 + 域名前置），配置文件 `chmod 600`
+- secret 用 FakeTLS（`ee` 前缀 + 域名前置）
+- 配置 `640 root:mtg` —— 仅 root 与 `mtg` 组可读，其他用户无权限
 - 专用用户 `mtg` 运行，systemd 启用 `NoNewPrivileges` / `ProtectSystem=strict` / `ProtectHome` 等
+- 监听 <1024 端口时自动加 `CAP_NET_BIND_SERVICE`，否则非 root 绑定会被内核拒绝
 
 ## 使用方法
 
@@ -75,6 +81,13 @@ bash mtg-install.sh -d www.apple.com
 
 # 换端口（443 被占用时）
 bash mtg-install.sh -p 8443
+
+# 重新显示连接链接
+bash mtg-install.sh --show
+
+# 卸载（保留配置）；加 --purge 连配置一起删
+bash mtg-install.sh --uninstall
+bash mtg-install.sh --uninstall --purge
 ```
 
 远程执行：
@@ -85,13 +98,13 @@ less /tmp/mtg-install.sh          # 建议先读一遍
 bash /tmp/mtg-install.sh
 ```
 
-安装完成后会输出 `t.me/proxy?...` 链接，点击即可导入 Telegram。
+安装完成后输出 `t.me/proxy?...` 与 `tg://proxy?...` 两种链接，点击即可导入 Telegram。
 
 ## 安装后的文件
 
 ```
 /usr/local/bin/mtg              # 二进制
-/etc/mtg.toml                   # 配置（含 secret，600）
+/etc/mtg.toml                   # 配置（含 secret，640 root:mtg）
 /etc/systemd/system/mtg.service # 服务单元
 ```
 
@@ -102,14 +115,16 @@ systemctl status mtg        # 状态
 journalctl -u mtg -f        # 日志
 mtg access /etc/mtg.toml    # 重新生成连接链接
 mtg doctor /etc/mtg.toml    # 配置自检（验证域名可达、SNI-DNS 匹配）
+bash mtg-install.sh --show  # 同上，不需记 mtg 的用法
 ```
 
 ## 注意
 
 - 需要 root 权限
 - 支持 `amd64` / `arm64`，其他架构会直接退出
-- 端口 443 常被 nginx 等服务占用，脚本会检测并提示，但不强行处理
+- 端口被其他服务占用时脚本会直接中止，不会装完起不来
 - 前端域名需真实可达，它只影响 TLS 握手的 SNI 伪装，不改变流量走向
+- 记得放行对应 tcp 端口
 # System Card - 系统信息快照工具
 
 一个轻量级的 Bash 脚本，用于快速生成美观的系统状态报告，帮助您一目了然地掌握服务器运行状况。
