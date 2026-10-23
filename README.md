@@ -34,6 +34,82 @@ bash -c "$(wget -qO- https://raw.githubusercontent.com/nsv2051/scripts/main/sync
 bash <(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/automtg.sh)
 
 ```
+
+> 上面 `automtg.sh` 是 Docker 版。下面 `mtg-install.sh` 是原生二进制版，两者独立，选一个即可。
+
+# mtg 原生二进制部署（可审计版）
+
+基于 [9seconds/mtg](https://github.com/9seconds/mtg) v2.2.8（MIT），不使用 Docker。
+设计目标是每个环节都可验证，适合对来源敏感的场景。
+
+## 与 automtg.sh 的区别
+
+| | automtg.sh | mtg-install.sh |
+|---|---|---|
+| 运行方式 | Docker | 原生二进制 + systemd |
+| 下载校验 | 无 | 强制 SHA-256 |
+| 版本 | 跟随 `:2` 标签漂移 | 锁定 2.2.8 |
+| 运行用户 | root | 专用低权限用户 `mtg` |
+| 权限加固 | 无 | systemd 沙箱选项 |
+| secret 生成 | `--hex bing.com` | FakeTLS，域名可配 |
+
+## 安全设计
+
+- 版本锁定，不跟随 latest 漂移
+- 下载后强制比对 SHA-256，不匹配立即中止且不落盘
+- 只从 GitHub Releases 下载，不经第三方镜像
+- secret 用 FakeTLS（`ee` 前缀 + 域名前置），配置文件 `chmod 600`
+- 专用用户 `mtg` 运行，systemd 启用 `NoNewPrivileges` / `ProtectSystem=strict` / `ProtectHome` 等
+
+## 使用方法
+
+```bash
+# 先自检，不写任何文件
+bash mtg-install.sh --dry-run
+
+# 默认：前端域名 www.microsoft.com，端口 443
+bash mtg-install.sh
+
+# 换 SNI 前端域名
+bash mtg-install.sh -d www.apple.com
+
+# 换端口（443 被占用时）
+bash mtg-install.sh -p 8443
+```
+
+远程执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/mtg-install.sh -o /tmp/mtg-install.sh
+less /tmp/mtg-install.sh          # 建议先读一遍
+bash /tmp/mtg-install.sh
+```
+
+安装完成后会输出 `t.me/proxy?...` 链接，点击即可导入 Telegram。
+
+## 安装后的文件
+
+```
+/usr/local/bin/mtg              # 二进制
+/etc/mtg.toml                   # 配置（含 secret，600）
+/etc/systemd/system/mtg.service # 服务单元
+```
+
+## 常用命令
+
+```bash
+systemctl status mtg        # 状态
+journalctl -u mtg -f        # 日志
+mtg access /etc/mtg.toml    # 重新生成连接链接
+mtg doctor /etc/mtg.toml    # 配置自检（验证域名可达、SNI-DNS 匹配）
+```
+
+## 注意
+
+- 需要 root 权限
+- 支持 `amd64` / `arm64`，其他架构会直接退出
+- 端口 443 常被 nginx 等服务占用，脚本会检测并提示，但不强行处理
+- 前端域名需真实可达，它只影响 TLS 握手的 SNI 伪装，不改变流量走向
 # System Card - 系统信息快照工具
 
 一个轻量级的 Bash 脚本，用于快速生成美观的系统状态报告，帮助您一目了然地掌握服务器运行状况。
