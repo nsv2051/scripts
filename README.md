@@ -1,16 +1,8 @@
-# 一键设置密钥登陆
+# nsv2051/scripts
 
-本仓库不再维护 SSH 公钥部署脚本，统一使用 [quickly-conf-sshd](https://github.com/nsv2051/quickly-conf-sshd)：
+Debian / Ubuntu 服务器常用运维脚本集合。每个脚本都能单文件运行，也可以从统一的 `toolbox.sh` 入口调用。
 
-```bash
-curl -s https://ssh.nnn.cx/sh | bash -s -- -c
-```
-
-详见该项目 README。
-
-# 统一入口 toolbox.sh
-
-一个入口覆盖本仓库全部工具：不带参数是交互菜单，带参数直达指定工具。
+## 快速开始
 
 ```bash
 # 交互菜单
@@ -20,7 +12,27 @@ bash <(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/toolbox
 bash <(curl -fsSL https://gitproxy.eu.org/https://raw.githubusercontent.com/nsv2051/scripts/main/toolbox.sh)
 ```
 
-## 用法
+## 工具一览
+
+| id | 脚本 | 说明 | 需要 root |
+| --- | --- | --- | --- |
+| `syscard` | `syscard.sh` | 系统信息快照（只读） | 否 |
+| `kworker` | `kworker-check.sh` | 挖矿 / 恶意进程伪装检测 | 是 |
+| `systool` | `systool.sh` | 交互式系统运维菜单 | 是 |
+| `synctime` | `sync-time.sh` | 时区设置 + 时间同步 | 是 |
+| `mtg` | `mtg-install.sh` | mtg MTProto 代理（原生二进制） | 是 |
+| `automtg` | `automtg.sh` | mtg MTProto 代理（Docker） | 是 |
+| `backup` | `setup-backup.sh` | 基于 rclone 的远程自动备份 | 是 |
+| `ddns` | `ddns.sh` | Cloudflare A 记录 DDNS | 否 |
+| `ssh` | [qcs](https://github.com/nsv2051/quickly-conf-sshd) | SSH 公钥部署 | 是 |
+
+`backup/` 目录存放已弃用的旧脚本，仅作存档，不建议直接使用。
+
+## 统一入口 toolbox.sh
+
+一个入口覆盖本仓库全部工具：不带参数是交互菜单，带参数直达指定工具。
+
+### 用法
 
 | 命令 | 说明 |
 | --- | --- |
@@ -39,29 +51,34 @@ bash toolbox.sh mtg -- --dry-run
 bash toolbox.sh ssh -- -c "17 * * * *"
 ```
 
-## 工具一览
+需要 root 的工具请用 `sudo bash toolbox.sh <id>`，工具箱不会自动提权。
 
-| id | 脚本 / 来源 | 说明 | root |
-| --- | --- | --- | --- |
-| `syscard` | `syscard.sh` | 系统信息快照（只读） | 否 |
-| `kworker` | `kworker-check.sh` | 挖矿/恶意进程检测 | 是 |
-| `systool` | `systool.sh` | 系统运维菜单（电源/源/DNS/磁盘/网络/CPU/NTP） | 是 |
-| `synctime` | `sync-time.sh` | 时区 + 时间同步 | 是 |
-| `mtg` | `mtg-install.sh` | mtg MTProto 代理（原生二进制，校验 SHA-256） | 是 |
-| `automtg` | `automtg.sh` | mtg Docker 版一键（随机端口） | 是 |
-| `backup` | `setup-backup.sh` | 远程备份配置（rclone + cron） | 是 |
-| `ddns` | `ddns.sh` | Cloudflare DDNS 更新 | 否 |
-| `ssh` | `https://ssh.nnn.cx/sh` | SSH 公钥部署（qcs 项目） | 是 |
+### 环境变量
 
-> `ssh` 项直接调用 [quickly-conf-sshd](https://github.com/nsv2051/quickly-conf-sshd) 的线上脚本，参数原样透传给 qcs（如 `-o`、`-c`、`-P`）。本仓库 `backup/` 下的两个旧 SSH 脚本仅作存档。
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `QCS_URL` | `https://ssh.nnn.cx/sh` | `ssh` 项调用的远程脚本地址 |
+| `RAW_BASE` | 本仓库 raw 地址 | 本地缺少脚本时的下载源 |
+| `RAW_PROXY` | `https://gitproxy.eu.org` | 下载加速通道，直连失败时回落；设为空则只走直连 |
 
-需要 root 的工具请用 `sudo bash toolbox.sh <id>`；工具箱不会自动提权。
+## SSH 公钥部署
 
-# Time Sync Script
+本仓库不再维护 SSH 公钥部署脚本，统一使用 [quickly-conf-sshd](https://github.com/nsv2051/quickly-conf-sshd)：
 
-用于设置系统时区并校准系统时间的生产级脚本（v2.3），适用于 Debian/Ubuntu、RHEL 系、openSUSE、Arch 等发行版。默认时区 `Asia/Shanghai`，默认 NTP 服务器 `ntp.aliyun.com`、`ntp.tencent.com`、`time.cloudflare.com`（按顺序尝试，国内源优先、海外源兜底）。
+```bash
+curl -s https://ssh.nnn.cx/sh | bash -s -- -c
+```
 
-## 功能
+脚本采用受管块写入（只修改标记区间内的内容）、逐行校验公钥、失败自动回滚，重复执行不会破坏 `sshd_config` 的其余部分。详见该项目 README。
+
+本仓库 `backup/` 下的 `add_ssh_key.sh`、`pubkey.sh` 是早期的独立实现，已弃用。
+
+## 时区与校时（sync-time.sh）
+
+设置系统时区并校准系统时间（v2.3），适用于 Debian/Ubuntu、RHEL 系、openSUSE、Arch 等发行版。默认时区 `Asia/Shanghai`，默认 NTP 服务器 `ntp.aliyun.com`、`ntp.tencent.com`、`time.cloudflare.com`（按顺序尝试，国内源优先、海外源兜底）。
+
+### 功能
+
 - **守护进程优先**：检测到 chrony / systemd-timesyncd / ntpd 正在运行时，交给守护进程校时，不调用 `ntpdate` 步进时钟
 - **偏差自检**：同步后读取实际 NTP 偏差，超过 2 秒明确告警并以非 0 退出，不再只看本地 `date`；读取失败自动重试 2 次，避免瞬时抖动误判
 - **cron 绝对路径**：写入 `/usr/sbin/ntpdate`（或实际探测到的绝对路径），避免 cron 默认 PATH 找不到命令而静默失败
@@ -71,9 +88,10 @@ bash toolbox.sh ssh -- -c "17 * * * *"
 - **可卸载**：`--uninstall` 只删除本脚本写入的行，保留用户自己的 crontab
 - 支持 `--dry-run` 干跑、`--check` 只读自检、`--no-cron`、自定义时区与多服务器
 
-## 参数
+### 参数
+
 | 参数 | 说明 |
-|---|---|
+| --- | --- |
 | `-t, --tz <时区>` | 时区，默认 `Asia/Shanghai`，写入前校验 `/usr/share/zoneinfo/<时区>` |
 | `-s, --server <主机>` | NTP 服务器，默认 `ntp.aliyun.com`、`ntp.tencent.com`、`time.cloudflare.com`，可重复指定；一旦使用本参数则整体覆盖默认列表，按顺序尝试 |
 | `--dry-run` | 只检测并打印将执行的动作，不写文件、不改时钟、不装包、不碰 crontab |
@@ -82,7 +100,8 @@ bash toolbox.sh ssh -- -c "17 * * * *"
 | `--no-cron` | 不写 crontab，也不改动已有 crontab（发现旧版坏行只告警不删除）；适合已有其它校时机制的机器 |
 | `-h, --help` | 显示帮助 |
 
-## 一键执行（推荐）
+### 一键执行（推荐）
+
 通过 `curl` 或 `wget` 从 GitHub 下载并运行：
 
 ```bash
@@ -97,23 +116,23 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/syn
 ```
 
 > 若机器已有 chrony 或 systemd-timesyncd，本脚本不会写 cron，也不会步进时钟，只让守护进程自行校时。
-# mtg一键
+
+## mtg 一键（Docker 版 automtg.sh）
+
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/automtg.sh)
-
 ```
 
-> 上面 `automtg.sh` 是 Docker 版。下面 `mtg-install.sh` 是原生二进制版，两者独立，选一个即可。
+随机生成端口，通过 Docker 运行。与下面的原生二进制版互相独立，选一个即可。
 
-# mtg 原生二进制部署（可审计版）
+## mtg 原生二进制部署（mtg-install.sh）
 
-基于 [9seconds/mtg](https://github.com/9seconds/mtg) v2.2.8（MIT），不使用 Docker。
-设计目标是每个环节都可验证，适合对来源敏感的场景。
+基于 [9seconds/mtg](https://github.com/9seconds/mtg) v2.2.8（MIT），不使用 Docker。设计目标是每个环节都可验证，适合对来源敏感的场景。
 
-## 与 automtg.sh 的区别
+### 与 automtg.sh 的区别
 
 | | automtg.sh | mtg-install.sh |
-|---|---|---|
+| --- | --- | --- |
 | 运行方式 | Docker | 原生二进制 + systemd |
 | 下载校验 | 无 | 强制 SHA-256 |
 | 版本 | 跟随 `:2` 标签漂移 | 锁定 2.2.8 |
@@ -125,7 +144,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/automtg
 | 卸载 | 无 | `--uninstall` |
 | 权限加固 | 无 | systemd 沙箱选项 |
 
-## 安全设计
+### 安全设计
 
 - 版本锁定，不跟随 latest 漂移
 - 下载后强制比对 SHA-256，不匹配立即中止且不落盘
@@ -135,7 +154,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/automtg
 - 专用用户 `mtg` 运行，systemd 启用 `NoNewPrivileges` / `ProtectSystem=strict` / `ProtectHome` 等
 - 监听 <1024 端口时自动加 `CAP_NET_BIND_SERVICE`，否则非 root 绑定会被内核拒绝
 
-## 使用方法
+### 使用方法
 
 ```bash
 # 先自检，不写任何文件
@@ -168,7 +187,7 @@ bash /tmp/mtg-install.sh
 
 安装完成后输出 `t.me/proxy?...` 与 `tg://proxy?...` 两种链接，点击即可导入 Telegram。
 
-## 安装后的文件
+### 安装后的文件
 
 ```
 /usr/local/bin/mtg              # 二进制
@@ -176,18 +195,18 @@ bash /tmp/mtg-install.sh
 /etc/systemd/system/mtg.service # 服务单元
 ```
 
-## 常用命令
+### 常用命令
 
 ```bash
 systemctl status mtg        # 状态
 journalctl -u mtg -f        # 日志
 mtg access /etc/mtg.toml    # 重新生成连接链接
 mtg doctor /etc/mtg.toml    # 配置自检（验证域名可达、SNI-DNS 匹配）
-bash mtg-install.sh --show  # 同上，不需记 mtg 的用法
+bash mtg-install.sh --show   # 同上，不需记 mtg 的用法
 bash mtg-install.sh --verify # 端到端验证（真正握手，见下）
 ```
 
-## 端到端验证（`--verify`）
+### 端到端验证（`--verify`）
 
 `systemctl is-active` 通过、端口在听，**都不能证明代理真的能用**。常见的假阳性有三种：
 
@@ -213,7 +232,7 @@ FakeTLS ClientHello  →  HMAC 校验  →  obfuscated2 握手  →  MTProto req
 
 依赖 `python3` 与 `pycryptodome`（`apt-get install -y python3-pycryptodome`）。缺依赖时脚本会明确提示并跳过，不会假装成功。
 
-## 注意
+### 注意
 
 - 需要 root 权限
 - 支持 `amd64` / `arm64`，其他架构会直接退出
@@ -221,13 +240,14 @@ FakeTLS ClientHello  →  HMAC 校验  →  obfuscated2 握手  →  MTProto req
 - 前端域名需真实可达，它只影响 TLS 握手的 SNI 伪装，不改变流量走向
 - 记得放行对应 tcp 端口；**装完请跑一次 `--verify`**，别只看服务状态
 - 云厂商安全组是独立一层，只改 iptables/1Panel 不管用，两层都要放行
-# System Card - 系统信息快照工具
 
-一个轻量级的 Bash 脚本，用于快速生成美观的系统状态报告，帮助您一目了然地掌握服务器运行状况。
+## 系统信息快照（syscard.sh）
 
-## ✨ 功能特性
+轻量级 Bash 脚本，快速生成系统状态报告。只读，不修改任何系统配置。
 
-- **硬件信息**：CPU、GPU型号
+### 功能特性
+
+- **硬件信息**：CPU、GPU 型号
 - **系统状态**：内核版本、系统发行版、运行天数、系统负载
 - **资源监控**：内存使用率、交换内存、磁盘空间
 - **进程统计**：进程总数、在线用户数
@@ -236,9 +256,8 @@ FakeTLS ClientHello  →  HMAC 校验  →  obfuscated2 握手  →  MTProto req
 - **自定义信息**：支持从 `/var/infomation/msg.txt` 读取额外信息
 - **彩色输出**：不同信息类型使用不同颜色，清晰易读
 
-## 🚀 快速开始
-
 ### 运行示例
+
 ```bash
 # 一键运行（无需安装）
 curl -sL https://raw.githubusercontent.com/nsv2051/scripts/main/syscard.sh | bash
@@ -250,48 +269,51 @@ sudo chmod +x /usr/local/bin/syscard
 # 之后随时运行
 syscard
 ```
-# Linux 系统管理脚本
 
-一个功能全面的交互式系统管理工具，集成了日常运维的常用功能，支持一键配置系统源、网络、CPU、时间同步等。
+## 系统运维菜单（systool.sh）
 
-## ✨ 核心功能
+交互式系统管理工具，集成日常运维的常用功能。
 
-- **系统维护**：软件源更换、系统更新、包管理
-- **资源监控**：磁盘检查、进程监控、内存使用
-- **网络配置**：DNS设置、网络诊断、IPv6 SLAAC
+### 核心功能
+
+- **系统维护**：软件源更换（阿里、腾讯、华为、清华、网易、中科大）、系统更新、包管理
+- **资源监控**：磁盘检查（`df -h` + 指定目录大小）、实时进程监控（`top -o %CPU`）、内存使用（`free -h`）
+- **网络配置**：DNS 设置、网络诊断、通过 SLAAC 获取 IPv6
 - **电源管理**：关机、重启
-- **高级配置**：CPU电源管理(P-State)、工作模式、NTP时间同步
+- **高级配置**：CPU 电源管理（P-State）、工作模式、NTP 时间同步
 
-## 🚀 快速开始
+NTP 配置为幂等写入：重复设置只会更新 `NTP=` 的值，不会产生重复行，也不会因为原行是注释状态而漏改。
 
 ### 运行示例
+
 ```bash
 # 一键运行（推荐）
 bash -c "$(curl -sL https://raw.githubusercontent.com/nsv2051/scripts/main/systool.sh)"
 
 # 下载脚本后运行
 wget https://raw.githubusercontent.com/nsv2051/scripts/main/systool.sh
-# 赋予权限并运行（需要root）
+# 赋予权限并运行（需要 root）
 chmod +x systool.sh
 sudo ./systool.sh
 ```
-# Linux 远程自动备份
+
+## 远程自动备份（setup-backup.sh）
 
 基于 rclone 的交互式远程备份工具，支持 40+ 云存储平台，一键配置定时备份。
 
-## 功能
+### 功能
 
 - 多远程异地备份（同时备份到多个云盘）
 - 通配符支持（`/root/*.sh` 每个文件独立备份）
-- 前置/后置钩子（如 `mysqldump` 备份数据库）
+- 前置 / 后置钩子（如 `mysqldump` 备份数据库）
 - 排除规则、网络重试、孤儿目录清理
-- 按数量/天数自动清理旧备份
+- 按数量 / 天数自动清理旧备份
 - 自动生成恢复脚本，交互式选择版本恢复
 - 配置持久化（重新运行自动读取旧配置）
 - Webhook 通知（钉钉、飞书等）
 - 卸载功能
 
-## 使用
+### 使用
 
 ```bash
 # 一键运行
@@ -300,11 +322,11 @@ curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/setup-backup.s
 # 国内代理
 curl -fsSL https://gitproxy.eu.org/https://raw.githubusercontent.com/nsv2051/scripts/main/setup-backup.sh -o /tmp/setup-backup.sh && bash /tmp/setup-backup.sh
 
-# 卸载
+# 卸载（--uninstall 或 -u）
 bash /opt/remote-backup/setup-backup.sh --uninstall
 ```
 
-## 生成的文件
+### 生成的文件
 
 ```
 /opt/remote-backup/
@@ -315,7 +337,7 @@ bash /opt/remote-backup/setup-backup.sh --uninstall
 /var/run/{项目名}.lock     # 锁文件
 ```
 
-## 常用命令
+### 常用命令
 
 ```bash
 # 手动备份
@@ -330,3 +352,81 @@ tail -f /var/log/remote-backup/项目名-$(date +%Y%m%d).log
 # 重新配置（自动读取旧配置，回车保留）
 bash /opt/remote-backup/setup-backup.sh
 ```
+
+## Cloudflare DDNS（ddns.sh）
+
+把服务器当前的公网 IPv4 写入 Cloudflare 的 A 记录，IP 变化时才调用写接口。
+
+需要 `curl` 与 `jq`；查询现有解析会依次尝试 `dig`、`host`、`getent`（有哪个用哪个）。
+
+### 认证方式
+
+二选一：
+
+- **API Token**（推荐）：只需要 `CF_API_TOKEN`，权限限定 `Zone.DNS:Edit`
+- **Global API Key**：需要 `CF_API_EMAIL` + `CF_API_KEY`
+
+### 参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `--check` | 只打印公网 IP 与当前 DNS 解析结果，不发起写请求；一致退出 0，不一致退出 1 |
+| `-h, --help` | 显示帮助 |
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CF_API_TOKEN` | — | Cloudflare API Token（推荐） |
+| `CF_API_EMAIL` | — | Cloudflare 账号邮箱（使用 Global API Key 时必填） |
+| `CF_API_KEY` | — | Cloudflare Global API Key（使用邮箱方式时必填） |
+| `CF_ZONE` | — | 区域名，例如 `example.com` |
+| `CF_RECORD` | — | A 记录全名，例如 `home.example.com` |
+| `CF_PROXIED` | `false` | 是否开启 Cloudflare 代理 |
+| `CF_TTL` | `1` | 记录 TTL，`1` 表示自动 |
+| `IP_URL` | `https://checkip.amazonaws.com` | 获取公网 IP 的地址 |
+| `DDNS_CONF` | `/etc/ddns.conf` | 配置文件路径 |
+
+环境变量优先于配置文件。兼容旧变量名 `cloudflare_auth_email`、`cloudflare_auth_key`、`zone`、`dnsrecord`。
+
+### 使用
+
+```bash
+# 只检查，不写
+CF_API_TOKEN=xxx CF_ZONE=example.com CF_RECORD=home.example.com bash ddns.sh --check
+
+# 实际更新
+CF_API_TOKEN=xxx CF_ZONE=example.com CF_RECORD=home.example.com bash ddns.sh
+
+# 或写入配置文件（shell 语法，注意 chmod 600）
+cat > /etc/ddns.conf <<'EOF'
+CF_API_TOKEN=xxx
+CF_ZONE=example.com
+CF_RECORD=home.example.com
+EOF
+chmod 600 /etc/ddns.conf
+```
+
+记录不存在时会自动创建；已存在则只更新 IP。
+
+## 挖矿与恶意进程检测（kworker-check.sh）
+
+只读检测工具，排查用户态伪装的 `kworker` 进程与挖矿木马。需要 root（部分检查要读其它用户的 crontab 与进程信息）。
+
+### 检测项
+
+1. 扫描所有 `kworker` 进程，找出用户态伪装（真正的 `kworker` 是内核线程，`/proc/<pid>/exe` 应为空）
+2. 扫描可疑落地文件：`/dev/shm`、`/tmp`、`/var/tmp`、`/root` 下的可执行文件，含隐藏 / 零宽字符命名
+3. 检查系统所有用户及系统级 Crontab
+4. 扫描已知挖矿进程特征
+5. 检查异常矿池网络连接
+
+缺少 `pgrep`、`readlink`、`ss`、`file` 时会尝试用 `apt` / `yum` / `apk` 自动补装。
+
+### 使用
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nsv2051/scripts/main/kworker-check.sh | bash
+```
+
+发现可疑项退出码为 1，全部正常退出 0，方便接进定时巡检。
