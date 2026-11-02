@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# mtg (MTProto proxy) 一键部署脚本  v2.1
+# mtg (MTProto proxy) 一键部署脚本  v2.2
 #
 # 上游: https://github.com/9seconds/mtg  (MIT License)
 # 本脚本不执行任何未校验的远程内容。
@@ -15,6 +15,7 @@
 #   bash mtg-install.sh --uninstall --purge  # 卸载并删除配置
 #   bash mtg-install.sh --show               # 仅重新显示连接链接
 #   bash mtg-install.sh --verify             # 端到端握手验证（FakeTLS + MTProto）
+#   bash mtg-install.sh --doctor             # 运维体检（状态/Recv-Q/fd/看护记录）
 # ============================================================
 set -euo pipefail
 
@@ -28,6 +29,12 @@ BIN="/usr/local/bin/mtg"
 CONF="/etc/mtg.toml"
 UNIT="/etc/systemd/system/mtg.service"
 SVC="mtg"
+WD_BIN="/usr/local/bin/mtg-watchdog.sh"
+WD_UNIT="/etc/systemd/system/mtg-watchdog.service"
+WD_TIMER="/etc/systemd/system/mtg-watchdog.timer"
+WD_SVC="mtg-watchdog"
+SYSCTL_FILE="/etc/sysctl.d/99-mtg.conf"
+DEPLOY_INFO="/etc/mtg-deploy-info.txt"
 
 # 官方 release 的 SHA-256
 # 来源: https://github.com/9seconds/mtg/releases/download/v2.2.8/mtg-2.2.8-checksums.txt
@@ -40,7 +47,7 @@ info() { printf '\033[32m[*]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,20p' "$0"; }
+usage() { sed -n '2,19p' "$0"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --purge)     PURGE=1; shift ;;
     --show)      MODE="show"; shift ;;
     --verify)    MODE="verify"; shift ;;
+    --doctor)    MODE="doctor"; shift ;;
     -h|--help)   usage; exit 0 ;;
     *) die "未知参数: $1（用 -h 查看用法）" ;;
   esac
@@ -156,27 +164,206 @@ show_links() {
 
 # ---------- verify 模式：真握手，不看"服务起来了" ----------
 # 只有拿到 Telegram 的 resPQ 才算可用。服务 active + 端口监听都可能是假阳性。
-do_verify() {
+
+# 按发行版尝试补装 pycryptodome；失败返回非零由调用方降级
+try_install_pycryptodome() {
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get install -y python3-pycryptodome
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y python3-pycryptodome
+  else
+    return 1
+  fi
+}
+
+# 直接写二进制到 stdout（不要用命令替换，NUL 会被丢弃）
+u16be() {
+  local n="$1"
+  printf "\\x$(printf '%02x' $(( (n >> 8) & 255 )))\\x$(printf '%02x' $(( n & 255 )))"
+}
+
+u24be() {
+  local n="$1"
+  printf "\\x$(printf '%02x' $(( (n >> 16) & 255 )))\\x$(printf '%02x' $(( (n >> 8) & 255 )))\\x$(printf '%02x' $(( n & 255 )))"
+}
+
+# 降级验证：纯 bash + openssl 的 FakeTLS ClientHello 探活。
+# 只能证明 TLS 记录层有响应，不能证明 MTProto req_pq。
+# 返回：0=完整通过（本函数不会返回 0）、3=降级通过、1=失败、2=无法验证
+verify_degraded() {
+  local ip="$1" port="$2" secret="$3"
+  local tmpd n ext_len body_len hs_len key_hex sni_hex sni
+  local i b0 b1 b2 b3 ts t0 t1 t2 t3 r0 r1 r2 r3 first st
+
+  if ! [[ "$secret" =~ ^[eE][eE][0-9a-fA-F]+$ ]]; then
+    warn "降级验证仅支持 hex 形式的 FakeTLS secret，当前 secret 无法解析"
+    return 2
+  fi
+  if (( ${#secret} < 34 )); then
+    warn "secret 长度异常，无法提取 key/SNI"
+    return 2
+  fi
+
+  key_hex="${secret:2:32}"
+  sni_hex="${secret:34}"
+  if (( ${#sni_hex} < 2 )) || (( ${#sni_hex} % 2 != 0 )); then
+    warn "secret 中缺少合法的 SNI 域名，无法降级验证"
+    return 2
+  fi
+
+  sni=""
+  for ((i = 0; i < ${#sni_hex}; i += 2)); do
+    sni+="$(printf "\\x${sni_hex:i:2}")"
+  done
+  [[ -n "$sni" ]] || { warn "SNI 解析为空，无法降级验证"; return 2; }
+
+  tmpd="$(mktemp -d)"
+  n=${#sni}
+  ext_len=$((9 + n))
+  body_len=$((84 + n))
+  hs_len=$((4 + body_len))
+
+  {
+    printf '\x00\x00'
+    u16be $((5 + n))
+    u16be $((3 + n))
+    printf '\x00'
+    u16be "$n"
+    printf '%s' "$sni"
+  } > "$tmpd/ext" || { rm -rf "$tmpd"; return 1; }
+
+  {
+    printf '\x03\x03'
+    head -c 32 /dev/zero
+    printf '\x20'
+    head -c 32 /dev/urandom
+    u16be 2
+    printf '\x13\x01'
+    printf '\x01\x00'
+    u16be "$ext_len"
+    cat "$tmpd/ext"
+  } > "$tmpd/body" || { rm -rf "$tmpd"; return 1; }
+
+  {
+    printf '\x01'
+    u24be "$body_len"
+    cat "$tmpd/body"
+  } > "$tmpd/hs" || { rm -rf "$tmpd"; return 1; }
+
+  {
+    printf '\x16\x03\x01'
+    u16be "$hs_len"
+    cat "$tmpd/hs"
+  } > "$tmpd/rec" || { rm -rf "$tmpd"; return 1; }
+
+  if ! openssl dgst -sha256 -mac HMAC -macopt "hexkey:${key_hex}" -binary "$tmpd/rec" > "$tmpd/digest" 2>/dev/null; then
+    rm -rf "$tmpd"
+    warn "openssl HMAC 计算失败，无法降级验证"
+    return 1
+  fi
+
+  read -r b0 b1 b2 b3 < <(od -An -tu1 -j28 -N4 "$tmpd/digest")
+  ts="$(date +%s)"
+  t0=$(( ts & 255 ))
+  t1=$(( (ts >> 8) & 255 ))
+  t2=$(( (ts >> 16) & 255 ))
+  t3=$(( (ts >> 24) & 255 ))
+  r0=$(( b0 ^ t0 ))
+  r1=$(( b1 ^ t1 ))
+  r2=$(( b2 ^ t2 ))
+  r3=$(( b3 ^ t3 ))
+
+  {
+    head -c 28 "$tmpd/digest"
+    printf "\\x$(printf '%02x' "$r0")\\x$(printf '%02x' "$r1")\\x$(printf '%02x' "$r2")\\x$(printf '%02x' "$r3")"
+  } > "$tmpd/rnd" || { rm -rf "$tmpd"; return 1; }
+  dd if="$tmpd/rnd" of="$tmpd/rec" bs=1 seek=11 conv=notrunc status=none 2>/dev/null \
+    || { rm -rf "$tmpd"; return 1; }
+
+  first=""
+  st=0
+  # shellcheck disable=SC2016
+  first="$(timeout 8 bash -c '
+    exec 3<>"/dev/tcp/$1/$2" || exit 10
+    cat "$3" >&3 || exit 11
+    head -c 1 <&3 2>/dev/null | od -An -tu1 | tr -d "[:space:]"
+  ' _ "$ip" "$port" "$tmpd/rec" 2>/dev/null)" || st=$?
+
+  rm -rf "$tmpd"
+
+  if (( st == 124 )); then
+    warn "降级验证失败：连接超时（8s）— 端口未放行或被中间设备丢弃"
+    return 1
+  fi
+  if (( st != 0 )) || [[ -z "$first" ]]; then
+    warn "降级验证失败：TCP 连接失败或未收到响应（退出码 ${st}）"
+    return 1
+  fi
+
+  case "$first" in
+    22|23)
+      info "降级验证通过：FakeTLS 握手层可达（首记录 0x$(printf '%02x' "$first")）"
+      info "  注意：仅证明 TLS 记录层有响应，未验证 MTProto req_pq"
+      info "  完整验证：apt-get install -y python3 python3-pycryptodome"
+      return 3
+      ;;
+    *)
+      warn "降级验证失败：首字节 0x$(printf '%02x' "$first")，预期 0x16/0x17"
+      return 1
+      ;;
+  esac
+}
+
+do_verify_inner() {
   local secret port ip
-  [[ -f "$BIN" ]] || die "未安装 mtg（$BIN 不存在）"
+  [[ -f "$BIN" ]] || { warn "未安装 mtg（$BIN 不存在）"; return 1; }
   secret="$(extract_secret)" || true
-  [[ -n "$secret" ]] || die "无法从 $CONF 读取 secret"
+  [[ -n "$secret" ]] || { warn "无法从 $CONF 读取 secret"; return 1; }
 
   port="$(sed -n 's/^[[:space:]]*bind-to[[:space:]]*=[[:space:]]*"[^"]*:\([0-9]*\)".*/\1/p' "$CONF" | head -1)"
   [[ -n "$port" ]] || port="$LISTEN_PORT"
 
-  command -v python3 >/dev/null 2>&1 || {
-    warn "未找到 python3，跳过端到端验证"; return 2
-  }
-  python3 -c 'import Crypto' 2>/dev/null || {
-    warn "缺少 pycryptodome，跳过端到端验证"
-    warn "Debian/Ubuntu: apt-get install -y python3-pycryptodome"
-    warn "其它系统:      pip3 install pycryptodome"
-    return 2
-  }
-
   ip="$(get_public_ip || true)"
   [[ -n "$ip" ]] || ip="127.0.0.1"
+
+  local need_python=1
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 -c 'import Crypto' 2>/dev/null; then
+      need_python=0
+    else
+      warn "已找到 python3，但缺少 pycryptodome，无法执行完整端到端验证"
+      if [[ -t 0 ]] && command -v read >/dev/null 2>&1; then
+        local ans=""
+        read -r -p "是否现在安装 python3-pycryptodome？[y/N] " ans || ans=""
+        case "$ans" in
+          y|Y|yes|YES)
+            info "尝试安装 python3-pycryptodome ..."
+            if try_install_pycryptodome >/dev/null 2>&1 \
+               && python3 -c 'import Crypto' 2>/dev/null; then
+              info "安装成功，继续完整验证"
+              need_python=0
+            else
+              warn "安装失败，降级为轻量握手验证"
+            fi
+            ;;
+          *)
+            warn "已跳过安装，降级为轻量握手验证"
+            ;;
+        esac
+      else
+        warn "非交互环境，已降级为轻量握手验证（未安装 pycryptodome）"
+      fi
+    fi
+  else
+    warn "未找到 python3，已降级为轻量握手验证"
+  fi
+
+  if (( need_python == 1 )); then
+    warn "降级验证：仅检查 FakeTLS 握手层可达，不验证 MTProto req_pq"
+    verify_degraded "$ip" "$port" "$secret"
+    return $?
+  fi
+
   info "端到端验证 ${ip}:${port}（FakeTLS 握手 + MTProto req_pq）"
 
   MTG_SECRET="$secret" python3 - "$ip" "$port" <<'PYEOF'
@@ -316,7 +503,169 @@ print()
 print("  结论：代理可用，已成功中继到 Telegram DC")
 sys.exit(0)
 PYEOF
+  return $?
 }
+
+do_verify() {
+  local rc=0
+  do_verify_inner || rc=$?
+  local res
+  case "$rc" in
+    0) res="完整通过" ;;
+    3) res="降级通过（未验证 MTProto）" ;;
+    1) res="失败" ;;
+    2) res="无法验证（缺依赖）" ;;
+    *) res="异常（rc=$rc）" ;;
+  esac
+  local f
+  f="$(dirname "$CONF")/.mtg-last-verify"
+  { printf '时间: %s\n结果: %s\n退出码: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$res" "$rc"; } > "$f" 2>/dev/null || true
+  chmod 0644 "$f" 2>/dev/null || true
+  return "$rc"
+}
+
+# ---------- doctor 模式：只读运维体检，不依赖 $BIN ----------
+do_doctor() {
+  local active enabled pid etimes d h m
+  local ssout recvq has_listener=0
+  local fd_count threads vmrss_kb vmrss_mb
+  local established close_wait
+  local wd_active wdlog somaxconn syn
+  local port verify_file
+
+  port="$(sed -n 's/^[[:space:]]*bind-to[[:space:]]*=[[:space:]]*"[^"]*:\([0-9]*\)".*/\1/p' "$CONF" 2>/dev/null | head -1 || true)"
+  [[ -n "$port" ]] || port="$LISTEN_PORT"
+
+  echo
+  echo "=============================================="
+  echo " mtg 运维体检"
+  echo "=============================================="
+
+  echo
+  echo "【服务状态】"
+  active="$(systemctl is-active "$SVC" 2>/dev/null || true)"
+  enabled="$(systemctl is-enabled "$SVC" 2>/dev/null || true)"
+  pid="$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || pid=0
+  echo " is-active : ${active:-unknown}"
+  echo " is-enabled: ${enabled:-unknown}"
+  if (( pid > 0 )) && [[ -d "/proc/${pid}" ]]; then
+    etimes="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "$etimes" =~ ^[0-9]+$ ]] || etimes=0
+    d=$((etimes / 86400))
+    h=$(((etimes % 86400) / 3600))
+    m=$(((etimes % 3600) / 60))
+    echo " MainPID   : ${pid}（已运行 ${d}天 ${h}时 ${m}分）"
+  else
+    pid=0
+    echo " MainPID   : 0（未运行）"
+  fi
+
+  echo
+  echo "【监听与积压】"
+  ssout="$(ss -H -tln "sport = :${port}" 2>/dev/null || true)"
+  if [[ -n "$ssout" ]]; then
+    has_listener=1
+    echo " ${ssout%%$'\n'*}"
+    recvq="$(printf '%s\n' "$ssout" | awk 'NR==1{print $2}')"
+    [[ "$recvq" =~ ^[0-9]+$ ]] || recvq=0
+    echo " Recv-Q    : ${recvq}"
+    if (( recvq > 100 )); then
+      warn "Recv-Q ${recvq} > 100，疑似 accept 卡死"
+    fi
+  else
+    recvq=0
+    echo " 端口 ${port} 无监听"
+  fi
+
+  echo
+  echo "【进程资源】"
+  if (( pid > 0 )) && [[ -d "/proc/${pid}" ]]; then
+    fd_count="$(ls "/proc/${pid}/fd" 2>/dev/null | wc -l | tr -d '[:space:]')"
+    threads="$(awk '/^Threads:/{print $2}' "/proc/${pid}/status" 2>/dev/null || true)"
+    vmrss_kb="$(awk '/^VmRSS:/{print $2}' "/proc/${pid}/status" 2>/dev/null || true)"
+    [[ "$threads" =~ ^[0-9]+$ ]] || threads="?"
+    if [[ "$vmrss_kb" =~ ^[0-9]+$ ]]; then
+      vmrss_mb="$(awk -v k="$vmrss_kb" 'BEGIN{printf "%.1f", k/1024}')"
+    else
+      vmrss_mb="?"
+    fi
+    echo " fd 数     : ${fd_count:-?}"
+    echo " 线程数    : ${threads}"
+    echo " VmRSS     : ${vmrss_mb} MB"
+  else
+    echo " 进程未运行，跳过"
+  fi
+
+  echo
+  echo "【连接状态】"
+  established="$(ss -H -tan state established "( sport = :${port} )" 2>/dev/null | wc -l | tr -d '[:space:]')"
+  close_wait="$(ss -H -tan state close-wait "( sport = :${port} )" 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [[ "$established" =~ ^[0-9]+$ ]] || established=0
+  [[ "$close_wait" =~ ^[0-9]+$ ]] || close_wait=0
+  echo " ESTABLISHED: ${established}"
+  echo " CLOSE_WAIT : ${close_wait}"
+  if (( close_wait > 50 )); then
+    warn "CLOSE_WAIT ${close_wait} > 50，可能有连接未正常释放"
+  fi
+
+  echo
+  echo "【看护状态】"
+  wd_active="$(systemctl is-active "$WD_TIMER" 2>/dev/null || true)"
+  echo " ${WD_TIMER}: ${wd_active:-unknown}"
+  systemctl list-timers --no-pager "$WD_TIMER" 2>/dev/null | head -3 || true
+  wdlog="$(journalctl -t mtg-watchdog -n 5 --no-pager 2>/dev/null || true)"
+  if [[ -n "$wdlog" && "$wdlog" != *"No entries"* ]]; then
+    printf '%s\n' "$wdlog"
+  else
+    echo " 暂无看护日志"
+  fi
+
+  echo
+  echo "【内核参数】"
+  somaxconn="$(sysctl -n net.core.somaxconn 2>/dev/null || true)"
+  syn="$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || true)"
+  [[ "$somaxconn" =~ ^[0-9]+$ ]] || somaxconn="?"
+  [[ "$syn" =~ ^[0-9]+$ ]] || syn="?"
+  echo " net.core.somaxconn           = ${somaxconn}（建议 >= 4096）"
+  echo " net.ipv4.tcp_max_syn_backlog = ${syn}（建议 >= 1024）"
+  if [[ "$somaxconn" =~ ^[0-9]+$ ]] && (( somaxconn < 4096 )); then
+    warn "somaxconn 偏低（${somaxconn} < 4096），可手动调整或重跑安装脚本"
+  fi
+  if [[ "$syn" =~ ^[0-9]+$ ]] && (( syn < 1024 )); then
+    warn "tcp_max_syn_backlog 偏低（${syn} < 1024），可手动调整或重跑安装脚本"
+  fi
+
+  echo
+  echo "【最近验证】"
+  verify_file="$(dirname "$CONF")/.mtg-last-verify"
+  if [[ -f "$verify_file" ]]; then
+    printf ' %s\n' "$(head -1 "$verify_file")"
+    printf ' %s\n' "$(sed -n '2p' "$verify_file")"
+  else
+    echo " 无记录（可执行 --verify）"
+  fi
+
+  echo
+  echo "【结论】"
+  if [[ "$active" != "active" ]]; then
+    echo " 结论：服务未运行（建议 systemctl start ${SVC} 或查看 journalctl -u ${SVC} -n 50）"
+  elif (( has_listener == 0 )); then
+    echo " 结论：疑似启动失败"
+  elif (( recvq > 100 )); then
+    echo " 结论：疑似假死（accept 卡死），看护应会在 60s 内重启"
+  elif (( close_wait <= 50 )); then
+    echo " 结论：正常"
+  else
+    echo " 结论：需人工检查"
+  fi
+  return 0
+}
+
+if [[ "$MODE" == "doctor" ]]; then
+  do_doctor
+  exit 0
+fi
 
 # ---------- show 模式 ----------
 if [[ "$MODE" == "show" ]]; then
@@ -325,14 +674,35 @@ if [[ "$MODE" == "show" ]]; then
 fi
 
 # ---------- verify 模式 ----------
+# 退出码语义：0=通过（完整或降级均视为通过），1=失败，2=无法验证
 if [[ "$MODE" == "verify" ]]; then
   rc=0
   do_verify || rc=$?
-  exit "$rc"
+  case "$rc" in
+    0) info "验证结果：完整通过（0）— FakeTLS 握手与 MTProto req_pq 均成功" ;;
+    3) info "验证结果：降级通过 — 仅确认 FakeTLS 握手层可达，未验证 MTProto req_pq（如需完整验证请安装 python3-pycryptodome）" ;;
+    1) warn "验证结果：失败（1）— 详见上方输出" ;;
+    2) warn "验证结果：无法验证（2）— 缺少依赖或 secret 格式不支持" ;;
+    *) warn "验证结果：异常退出码 ${rc}" ;;
+  esac
+  case "$rc" in
+    0|3) exit 0 ;;
+    1) exit 1 ;;
+    *) exit 2 ;;
+  esac
 fi
 
 # ---------- uninstall 模式 ----------
 if [[ "$MODE" == "uninstall" ]]; then
+  info "停止并移除看护 timer"
+  systemctl disable --now "$WD_TIMER" 2>/dev/null || true
+  info "停止看护服务"
+  systemctl stop "$WD_SVC" 2>/dev/null || true
+  info "删除看护脚本与 unit/timer"
+  rm -f "$WD_TIMER" "$WD_UNIT" "$WD_BIN"
+  info "清理看护运行状态 /run/mtg-watchdog"
+  rm -rf /run/mtg-watchdog
+
   info "停止并移除服务"
   systemctl stop "$SVC" 2>/dev/null || true
   systemctl disable "$SVC" 2>/dev/null || true
@@ -341,6 +711,15 @@ if [[ "$MODE" == "uninstall" ]]; then
 
   rm -f "$BIN"
   info "已删除 $BIN"
+
+  if [[ -f "$SYSCTL_FILE" ]]; then
+    rm -f "$SYSCTL_FILE"
+    info "已删除 $SYSCTL_FILE（未主动改回内核参数，如需回滚请重启或 sysctl -w）"
+  fi
+
+  rm -f "$DEPLOY_INFO"
+  info "已删除部署摘要 $DEPLOY_INFO"
+  rm -f "$(dirname "$CONF")/.mtg-last-verify"
 
   if [[ $PURGE -eq 1 ]]; then
     rm -f "$CONF"
@@ -409,6 +788,16 @@ if [[ $DRY_RUN -eq 1 ]]; then
   if [[ $NEED_CAP -eq 1 ]]; then
     info "  提权需求   需 CAP_NET_BIND_SERVICE（<${UNPRIV_START} 端口，脚本会自动配置）"
   fi
+  info "dry-run: 将写入以下文件"
+  info "  ${BIN}"
+  info "  ${CONF}"
+  info "  ${UNIT}"
+  info "  ${WD_BIN}"
+  info "  ${WD_UNIT}"
+  info "  ${WD_TIMER}"
+  info "  看护：每 60s 检查，Recv-Q>100 且持续 3s 则抓栈并重启，每小时最多 3 次"
+  info "  ${SYSCTL_FILE}（仅当当前值更小时写入 somaxconn=4096 / tcp_max_syn_backlog=1024）"
+  info "  ${DEPLOY_INFO}（部署摘要）"
   exit 0
 fi
 
@@ -468,11 +857,57 @@ if [[ -z "$SECRET" ]]; then
   cat > "$CONF" <<EOF
 # mtg 配置 — 由 mtg-install.sh 生成
 # 文档: https://github.com/9seconds/mtg/blob/master/example.config.toml
+# 可用 \`mtg doctor /etc/mtg.toml\` 自检。
+
+# 代理密钥（FakeTLS + 必填）
+secret = "${SECRET}"
+
+# 监听地址与端口；0.0.0.0 表示全部 IPv4 网卡
+bind-to = "0.0.0.0:${LISTEN_PORT}"
+
+# 并发连接上限。积压事故期间 8192 足够；机器内存越大可再上调
+concurrency = 8192
+
+# 优先使用的出口协议族：prefer-ipv4 / prefer-ipv6
+prefer-ip = "prefer-ipv4"
+
+# 前端伪装端口（默认 443）。经 CDN/反代接入时才需改动
+domain-fronting-port = 443
+
+# DoH 解析地址：DNS 走这里可避开被污染的系统 DNS
+[network]
+doh-ip = "1.1.1.1"
+
+# 上游网络超时与保活，避免半死连接长期堆积
+[network.timeout]
+tcp = "5s"
+http = "10s"
+idle = "5m"
+handshake = "10s"
+
+[network.keep-alive]
+disabled = false
+idle = "15s"
+interval = "15s"
+count = 9
+EOF
+  chmod 600 "$CONF"
+  if ! "$BIN" doctor "$CONF" >/dev/null 2>&1; then
+    warn "配置自检未通过，回滚到最小配置"
+    cp -f "$CONF" "${CONF}.rejected" 2>/dev/null || true
+    chmod 600 "${CONF}.rejected" 2>/dev/null || true
+    cat > "$CONF" <<EOF
+# 最小可用配置（doctor 自检失败后的回滚产物）
 secret = "${SECRET}"
 bind-to = "0.0.0.0:${LISTEN_PORT}"
 EOF
-  chmod 600 "$CONF"
+    chmod 600 "$CONF"
+    warn "已回滚为最小配置；原配置备份在 ${CONF}.rejected，请检查备份与 journalctl 后手动修复"
+  else
+    info "配置自检通过（mtg doctor）"
+  fi
   info "配置写入 ${CONF}（权限 600）"
+  umask "$OLD_UMASK"
 else
   # 已有 secret，仅同步端口，保持 600
   PORT_OLD="$(sed -n 's/^[[:space:]]*bind-to[[:space:]]*=[[:space:]]*"[^"]*:\([0-9]*\)".*/\1/p' "$CONF" | head -1)"
@@ -489,6 +924,245 @@ fi
 chown root:mtg "$CONF"
 chmod 640 "$CONF"
 info "配置权限 640 root:mtg（仅 root 与 mtg 组可读）"
+
+# 运行期看护：检测 accept 卡死（Recv-Q 积压）并自愈
+write_watchdog() {
+  info "安装看护脚本 ${WD_BIN}"
+  cat > "$WD_BIN" <<'WATCHDOG'
+#!/usr/bin/env bash
+set -uo pipefail
+
+SVC="${WD_SERVICE:-mtg}"
+PORT="${WD_PORT:-443}"
+RECVQ_THRESHOLD="${WD_RECVQ_THRESHOLD:-100}"
+MAX_RESTARTS="${WD_MAX_RESTARTS:-3}"
+STATE_DIR="${WD_STATE_DIR:-/run/mtg-watchdog}"
+INSTALL_SCRIPT="${WD_INSTALL_SCRIPT:-__INSTALL_SCRIPT__}"
+VERIFY_INTERVAL="${WD_VERIFY_INTERVAL:-86400}"
+
+log() {
+  logger -t mtg-watchdog -- "$*" 2>/dev/null || true
+  printf '%s\n' "$*" >&2
+}
+
+ss_output() {
+  ss -H -tln "sport = :${PORT}" 2>/dev/null || true
+}
+
+get_recvq() {
+  local out="$1"
+  [[ -n "$out" ]] || { printf ''; return 0; }
+  printf '%s\n' "$out" | awk 'NR==1{print $2}'
+}
+
+restart_allowed() {
+  local now cutoff f count
+  now="$(date +%s)"
+  cutoff=$((now - 3600))
+  f="$STATE_DIR/restarts"
+  touch "$f"
+  awk -v cutoff="$cutoff" '$1 + 0 >= cutoff' "$f" > "$f.tmp" 2>/dev/null || true
+  mv "$f.tmp" "$f"
+  count="$(wc -l < "$f" | tr -d '[:space:]')"
+  if (( count >= MAX_RESTARTS )); then
+    log "restart budget exhausted (${count}/h)，请人工介入"
+    return 1
+  fi
+  printf '%s\n' "$now" >> "$f"
+  return 0
+}
+
+mkdir -p "$STATE_DIR"
+
+exec 9>"$STATE_DIR/lock"
+flock -n 9 || { log "another watchdog run in progress, skip"; exit 0; }
+
+reason=""
+kill_stack=0
+q=""
+
+if ! systemctl is-active --quiet "$SVC"; then
+  reason="service-not-active"
+else
+  out="$(ss_output)"
+  if [[ -z "$out" ]]; then
+    reason="no-listener"
+  else
+    q="$(get_recvq "$out")"
+    if [[ -z "$q" ]]; then
+      log "cannot read Recv-Q (insufficient privilege?)"
+      exit 0
+    fi
+    if (( EUID != 0 )); then
+      log "not running as root; Recv-Q may be unreliable, active-only check passed"
+      exit 0
+    fi
+    if (( q > RECVQ_THRESHOLD )); then
+      sleep 3
+      q2="$(get_recvq "$(ss_output)")"
+      if [[ -n "$q2" ]] && (( q2 > RECVQ_THRESHOLD )); then
+        reason="recvq-stuck:${q}->${q2}"
+        kill_stack=1
+      fi
+    fi
+  fi
+fi
+
+if [[ -z "$reason" ]]; then
+  if [[ -n "$INSTALL_SCRIPT" && -f "$INSTALL_SCRIPT" ]]; then
+    vstate="$STATE_DIR/last-verify"
+    now="$(date +%s)"
+    last=0
+    if [[ -f "$vstate" ]]; then
+      last="$(stat -c %Y "$vstate" 2>/dev/null || echo 0)"
+    fi
+    if (( now - last >= VERIFY_INTERVAL )); then
+      vrc=0
+      timeout 120 "$INSTALL_SCRIPT" --verify </dev/null >/tmp/mtg-verify.log 2>&1 || vrc=$?
+      case "$vrc" in
+        0) log "daily verify ok" ;;
+        3|2) log "daily verify degraded (rc=${vrc}), see /tmp/mtg-verify.log" ;;
+        *) log "daily verify failed (rc=${vrc}), see /tmp/mtg-verify.log" ;;
+      esac
+      touch "$vstate" 2>/dev/null || true
+      printf '%s rc=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$vrc" >> "$vstate" 2>/dev/null || true
+    fi
+  fi
+fi
+
+if [[ -z "$reason" ]]; then
+  log "watchdog ok (active, listener present, recvq=${q:-?})"
+  exit 0
+fi
+
+log "unhealthy: ${reason}"
+
+if (( kill_stack == 1 )); then
+  systemctl kill -s QUIT --kill-who=main "$SVC" 2>/dev/null || true
+  sleep 1
+fi
+
+if ! restart_allowed; then
+  exit 0
+fi
+
+if systemctl restart "$SVC"; then
+  log "restarted ${SVC} (reason=${reason})"
+else
+  log "restart ${SVC} failed (reason=${reason})"
+fi
+
+exit 0
+WATCHDOG
+  chmod 0755 "$WD_BIN"
+  sed -i "s|__INSTALL_SCRIPT__|$(readlink -f "$0")|g" "$WD_BIN"
+
+  info "安装看护 unit/timer"
+  cat > "$WD_UNIT" <<EOF
+[Unit]
+Description=mtg watchdog - detect and recover hung MTProto proxy
+Documentation=https://github.com/9seconds/mtg
+After=mtg.service
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=${WD_BIN}
+EOF
+  chmod 0644 "$WD_UNIT"
+
+  cat > "$WD_TIMER" <<'TIMER'
+[Unit]
+Description=Run mtg watchdog every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+TIMER
+  chmod 0644 "$WD_TIMER"
+}
+
+# ---------- 4.5 内核参数（保守、可回滚） ----------
+# 只上调，不降级；当前值已经足够时完全不碰系统。
+apply_sysctl() {
+  local somaxconn_target=4096
+  local syn_target=1024
+  local cur_somaxconn cur_syn need=0 old_umask bak sysctl_dir
+
+  cur_somaxconn="$(sysctl -n net.core.somaxconn 2>/dev/null || echo 0)"
+  cur_syn="$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo 0)"
+  [[ "$cur_somaxconn" =~ ^[0-9]+$ ]] || cur_somaxconn=0
+  [[ "$cur_syn" =~ ^[0-9]+$ ]] || cur_syn=0
+
+  (( cur_somaxconn < somaxconn_target )) && need=1
+  (( cur_syn < syn_target )) && need=1
+
+  if (( need == 0 )); then
+    info "内核参数已足够，跳过（somaxconn=${cur_somaxconn}, tcp_max_syn_backlog=${cur_syn}）"
+    return 0
+  fi
+
+  # 精简系统/容器可能没有 /etc/sysctl.d；缺目录时 cat > 会失败并中断安装
+  sysctl_dir="$(dirname "$SYSCTL_FILE")"
+  if [[ ! -d "$sysctl_dir" ]]; then
+    if mkdir -p "$sysctl_dir" 2>/dev/null; then
+      info "已创建目录 ${sysctl_dir}"
+    else
+      warn "无法创建 ${sysctl_dir}，跳过内核参数写入"
+      return 0
+    fi
+  fi
+
+  if [[ -f "$SYSCTL_FILE" ]]; then
+    bak="${SYSCTL_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+    if cp -f "$SYSCTL_FILE" "$bak" 2>/dev/null; then
+      info "已备份原 sysctl 文件到 ${bak}"
+    else
+      warn "备份 ${SYSCTL_FILE} 失败，继续覆盖写入"
+    fi
+  fi
+
+  old_umask="$(umask)"
+  umask 022
+  if ! { cat > "$SYSCTL_FILE" <<EOF
+# 由 mtg-install.sh 生成 —— 缓解 accept 队列积压
+# 现象：高并发时 Recv-Q 持续增长、新连接被丢弃，代理表现为时通时断。
+# net.core.somaxconn 控制已完成三次握手的连接队列上限；
+# net.ipv4.tcp_max_syn_backlog 控制半连接（SYN）队列上限。
+# 回滚：删除本文件后执行 sysctl --system，或直接重启（内核参数自然恢复默认）。
+net.core.somaxconn = ${somaxconn_target}
+net.ipv4.tcp_max_syn_backlog = ${syn_target}
+EOF
+  }; then
+    warn "写入 ${SYSCTL_FILE} 失败，跳过内核参数（不影响代理运行）"
+    umask "$old_umask"
+    return 0
+  fi
+  chmod 0644 "$SYSCTL_FILE"
+  umask "$old_umask"
+
+  if ! sysctl --system >/dev/null 2>&1; then
+    warn "sysctl --system 执行失败，请手动检查 ${SYSCTL_FILE}"
+  fi
+
+  cur_somaxconn="$(sysctl -n net.core.somaxconn 2>/dev/null || echo 0)"
+  cur_syn="$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo 0)"
+  [[ "$cur_somaxconn" =~ ^[0-9]+$ ]] || cur_somaxconn=0
+  [[ "$cur_syn" =~ ^[0-9]+$ ]] || cur_syn=0
+
+  if (( cur_somaxconn < somaxconn_target )) || (( cur_syn < syn_target )); then
+    warn "内核参数校验未达预期（somaxconn=${cur_somaxconn}, tcp_max_syn_backlog=${cur_syn}）"
+    warn "  请手动检查 ${SYSCTL_FILE} 与 sysctl --system 的输出"
+  else
+    info "内核参数已应用（somaxconn=${cur_somaxconn}, tcp_max_syn_backlog=${cur_syn}）"
+  fi
+  return 0
+}
 
 # ---------- 5. systemd ----------
 info "配置 systemd 服务"
@@ -516,6 +1190,10 @@ Group=mtg
 ExecStart=${BIN} run ${CONF}
 Restart=always
 RestartSec=3
+# 日志统一进 journal：journalctl -u mtg 查服务自身输出；
+# journalctl -t mtg-watchdog 查看护脚本（logger 写入，与 unit 日志分开）
+StandardOutput=journal
+StandardError=journal
 ${CAP_LINES}
 # 权限收紧
 NoNewPrivileges=true
@@ -538,6 +1216,13 @@ systemctl daemon-reload
 systemctl enable "$SVC" >/dev/null 2>&1
 systemctl restart "$SVC"
 
+write_watchdog
+systemctl daemon-reload
+WD_TIMER_ENABLED=0
+if systemctl enable --now "$WD_TIMER" >/dev/null 2>&1; then
+  WD_TIMER_ENABLED=1
+fi
+
 # ---------- 6. 启动校验 ----------
 info "等待服务就绪"
 OK=0
@@ -554,16 +1239,97 @@ if [[ $OK -ne 1 ]]; then
   die "mtg 启动失败"
 fi
 info "服务已启动并在 ${LISTEN_PORT} 监听"
+info "日志：journalctl -u ${SVC} 看服务本身，journalctl -t mtg-watchdog 看看护记录（两者分开）"
+apply_sysctl
 firewall_hint "$LISTEN_PORT"
 
+if systemctl is-enabled --quiet "$WD_TIMER" && systemctl is-active --quiet "$WD_TIMER"; then
+  info "看护已启用：每 60s 检查一次（日志 journalctl -t mtg-watchdog）"
+else
+  warn "看护 timer 未正常启用（enable 结果: ${WD_TIMER_ENABLED:-0}）"
+  warn "  排查: systemctl status mtg-watchdog.timer"
+  warn "  日志: journalctl -u mtg-watchdog"
+fi
+
+write_deploy_info() {
+  local wd_state sysctl_state deploy_dir
+  wd_state="$(systemctl is-active "$WD_TIMER" 2>/dev/null || true)"
+  [[ -n "$wd_state" ]] || wd_state="unknown"
+  if [[ -f "$SYSCTL_FILE" ]]; then
+    sysctl_state="存在"
+  else
+    sysctl_state="不存在"
+  fi
+
+  # 防御性兜底：/etc 一般存在，但精简系统/容器仍可能缺父目录
+  deploy_dir="$(dirname "$DEPLOY_INFO")"
+  if [[ ! -d "$deploy_dir" ]]; then
+    if mkdir -p "$deploy_dir" 2>/dev/null; then
+      info "已创建目录 ${deploy_dir}"
+    else
+      warn "无法创建 ${deploy_dir}，跳过部署摘要写入"
+      return 0
+    fi
+  fi
+
+  umask 022
+  if ! { cat > "$DEPLOY_INFO" <<EOF
+# mtg 部署摘要 — 由 mtg-install.sh 生成，重装会覆盖
+生成时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
+脚本版本: v2.2（含看护）
+mtg 版本: ${MTG_VERSION}
+监听端口: ${LISTEN_PORT}
+前端域名: ${FRONT_DOMAIN}
+安装路径: ${BIN}
+配置文件: ${CONF}
+systemd 单元: ${UNIT}
+看护脚本: ${WD_BIN}
+看护定时器: ${WD_TIMER}（状态: ${wd_state}）
+内核参数文件: ${SYSCTL_FILE}（${sysctl_state}）
+EOF
+  }; then
+    warn "写入 ${DEPLOY_INFO} 失败，跳过部署摘要（不影响代理运行）"
+    return 0
+  fi
+  chmod 0644 "$DEPLOY_INFO"
+
+  if [[ -n "${SECRET:-}" ]] && grep -qF -- "$SECRET" "$DEPLOY_INFO" 2>/dev/null; then
+    warn "部署摘要自检发现 secret，已删除并重写"
+    rm -f "$DEPLOY_INFO"
+    if ! { cat > "$DEPLOY_INFO" <<EOF
+# mtg 部署摘要 — 由 mtg-install.sh 生成，重装会覆盖
+生成时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
+脚本版本: v2.2（含看护）
+mtg 版本: ${MTG_VERSION}
+监听端口: ${LISTEN_PORT}
+前端域名: ${FRONT_DOMAIN}
+安装路径: ${BIN}
+配置文件: ${CONF}
+systemd 单元: ${UNIT}
+看护脚本: ${WD_BIN}
+看护定时器: ${WD_TIMER}（状态: ${wd_state}）
+内核参数文件: ${SYSCTL_FILE}（${sysctl_state}）
+EOF
+    }; then
+      warn "写入 ${DEPLOY_INFO} 失败，跳过部署摘要（不影响代理运行）"
+      return 0
+    fi
+    chmod 0644 "$DEPLOY_INFO"
+  fi
+  info "部署摘要已写入 ${DEPLOY_INFO}"
+}
+
 # ---------- 7. 输出 ----------
-show_links
+show_links || true
+write_deploy_info || true
 
 echo
 echo " 常用命令："
 echo "   systemctl status ${SVC}      查看状态"
-echo "   journalctl -u ${SVC} -f      实时日志"
+echo "   journalctl -u ${SVC} -f        实时日志（mtg 进程本身）"
+echo "   journalctl -t mtg-watchdog -f  看护日志（重启/假死记录，logger 写入）"
 echo "   ${BIN} doctor ${CONF}        配置自检"
+echo "   bash $0 --doctor             运维体检"
 echo "   bash $0 --show               重新显示链接"
 echo "   bash $0 --uninstall          卸载"
 echo
