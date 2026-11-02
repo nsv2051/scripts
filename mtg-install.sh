@@ -33,6 +33,7 @@ WD_BIN="/usr/local/bin/mtg-watchdog.sh"
 WD_UNIT="/etc/systemd/system/mtg-watchdog.service"
 WD_TIMER="/etc/systemd/system/mtg-watchdog.timer"
 WD_SVC="mtg-watchdog"
+WD_TIMER_UNIT="${WD_SVC}.timer"
 SYSCTL_FILE="/etc/sysctl.d/99-mtg.conf"
 DEPLOY_INFO="/etc/mtg-deploy-info.txt"
 
@@ -611,9 +612,9 @@ do_doctor() {
 
   echo
   echo "【看护状态】"
-  wd_active="$(systemctl is-active "$WD_TIMER" 2>/dev/null || true)"
-  echo " ${WD_TIMER}: ${wd_active:-unknown}"
-  systemctl list-timers --no-pager "$WD_TIMER" 2>/dev/null | head -3 || true
+  wd_active="$(systemctl is-active "$WD_TIMER_UNIT" 2>/dev/null || true)"
+  echo " ${WD_TIMER_UNIT}: ${wd_active:-unknown}"
+  systemctl list-timers --no-pager "$WD_TIMER_UNIT" 2>/dev/null | head -3 || true
   wdlog="$(journalctl -t mtg-watchdog -n 5 --no-pager 2>/dev/null || true)"
   if [[ -n "$wdlog" && "$wdlog" != *"No entries"* ]]; then
     printf '%s\n' "$wdlog"
@@ -695,13 +696,14 @@ fi
 # ---------- uninstall 模式 ----------
 if [[ "$MODE" == "uninstall" ]]; then
   info "停止并移除看护 timer"
-  systemctl disable --now "$WD_TIMER" 2>/dev/null || true
+  systemctl disable --now "$WD_TIMER_UNIT" 2>/dev/null || true
   info "停止看护服务"
   systemctl stop "$WD_SVC" 2>/dev/null || true
   info "删除看护脚本与 unit/timer"
   rm -f "$WD_TIMER" "$WD_UNIT" "$WD_BIN"
-  info "清理看护运行状态 /run/mtg-watchdog"
-  rm -rf /run/mtg-watchdog
+  info "清理看护运行状态"
+  rm -rf /var/lib/mtg-watchdog /run/mtg-watchdog
+  rm -f /usr/local/libexec/mtg-install.sh
 
   info "停止并移除服务"
   systemctl stop "$SVC" 2>/dev/null || true
@@ -872,11 +874,13 @@ concurrency = 8192
 prefer-ip = "prefer-ipv4"
 
 # 前端伪装端口（默认 443）。经 CDN/反代接入时才需改动
-domain-fronting-port = 443
+# mtg >= 2.3 起使用 [domain-fronting] port；顶层 domain-fronting-port 已废弃
+[domain-fronting]
+port = 443
 
-# DoH 解析地址：DNS 走这里可避开被污染的系统 DNS
+# DNS 解析：走 DoH 可避开被污染的系统 DNS（[network] dns，旧的 doh-ip 已废弃）
 [network]
-doh-ip = "1.1.1.1"
+dns = "1.1.1.1"
 
 # 上游网络超时与保活，避免半死连接长期堆积
 [network.timeout]
@@ -892,8 +896,11 @@ interval = "15s"
 count = 9
 EOF
   chmod 600 "$CONF"
-  if ! "$BIN" doctor "$CONF" >/dev/null 2>&1; then
-    warn "配置自检未通过，回滚到最小配置"
+  docout="$("$BIN" doctor "$CONF" 2>&1 || true)"
+  # 只有“配置解析类”错误才回滚；SNI-DNS/DC 可达性属于环境性告警，
+  # 不应因此丢弃 concurrency/prefer-ip 等完整配置（fake-TLS 域名通常不指向本机）。
+  if printf '%s\n' "$docout" | grep -qiE 'cannot parse|invalid option|unknown option|failed to parse|is not valid|unexpected|malformed'; then
+    warn "配置解析失败，回滚到最小配置"
     cp -f "$CONF" "${CONF}.rejected" 2>/dev/null || true
     chmod 600 "${CONF}.rejected" 2>/dev/null || true
     cat > "$CONF" <<EOF
@@ -904,7 +911,12 @@ EOF
     chmod 600 "$CONF"
     warn "已回滚为最小配置；原配置备份在 ${CONF}.rejected，请检查备份与 journalctl 后手动修复"
   else
-    info "配置自检通过（mtg doctor）"
+    envwarn="$(printf '%s\n' "$docout" | grep '❌' || true)"
+    if [[ -n "$envwarn" ]]; then
+      warn "mtg doctor 环境性告警（不影响启动，配置保留）："
+      printf '%s\n' "$envwarn" | sed 's/^/    /'
+    fi
+    info "配置自检通过（解析无误，完整参数保留）"
   fi
   info "配置写入 ${CONF}（权限 600）"
   umask "$OLD_UMASK"
@@ -936,7 +948,7 @@ SVC="${WD_SERVICE:-mtg}"
 PORT="${WD_PORT:-443}"
 RECVQ_THRESHOLD="${WD_RECVQ_THRESHOLD:-100}"
 MAX_RESTARTS="${WD_MAX_RESTARTS:-3}"
-STATE_DIR="${WD_STATE_DIR:-/run/mtg-watchdog}"
+STATE_DIR="${WD_STATE_DIR:-/var/lib/mtg-watchdog}"
 INSTALL_SCRIPT="${WD_INSTALL_SCRIPT:-__INSTALL_SCRIPT__}"
 VERIFY_INTERVAL="${WD_VERIFY_INTERVAL:-86400}"
 
@@ -989,8 +1001,8 @@ else
     reason="no-listener"
   else
     q="$(get_recvq "$out")"
-    if [[ -z "$q" ]]; then
-      log "cannot read Recv-Q (insufficient privilege?)"
+    if [[ ! "$q" =~ ^[0-9]+$ ]]; then
+      log "cannot parse Recv-Q (got '${q}'), skip this round"
       exit 0
     fi
     if (( EUID != 0 )); then
@@ -1018,11 +1030,13 @@ if [[ -z "$reason" ]]; then
     fi
     if (( now - last >= VERIFY_INTERVAL )); then
       vrc=0
-      timeout 120 "$INSTALL_SCRIPT" --verify </dev/null >/tmp/mtg-verify.log 2>&1 || vrc=$?
+      # verify 最长 60s：先释放 flock，避免每日验证期间巡检被 skip 造成监控盲区
+      exec 9>&-
+      timeout 60 bash "$INSTALL_SCRIPT" --verify </dev/null >"$STATE_DIR/last-verify.log" 2>&1 || vrc=$?
       case "$vrc" in
         0) log "daily verify ok" ;;
-        3|2) log "daily verify degraded (rc=${vrc}), see /tmp/mtg-verify.log" ;;
-        *) log "daily verify failed (rc=${vrc}), see /tmp/mtg-verify.log" ;;
+        3|2) log "daily verify degraded (rc=${vrc}), see ${STATE_DIR}/last-verify.log" ;;
+        *) log "daily verify failed (rc=${vrc}), see ${STATE_DIR}/last-verify.log" ;;
       esac
       touch "$vstate" 2>/dev/null || true
       printf '%s rc=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$vrc" >> "$vstate" 2>/dev/null || true
@@ -1031,9 +1045,12 @@ if [[ -z "$reason" ]]; then
 fi
 
 if [[ -z "$reason" ]]; then
-  log "watchdog ok (active, listener present, recvq=${q:-?})"
+  # 只在“恢复为健康”时记一条，避免每分钟刷屏淹没真实告警
+  [[ -f "$STATE_DIR/healthy" ]] || log "healthy (active, listener present, recvq=${q:-?})"
+  touch "$STATE_DIR/healthy" 2>/dev/null || true
   exit 0
 fi
+rm -f "$STATE_DIR/healthy" 2>/dev/null || true
 
 log "unhealthy: ${reason}"
 
@@ -1055,7 +1072,23 @@ fi
 exit 0
 WATCHDOG
   chmod 0755 "$WD_BIN"
-  sed -i "s|__INSTALL_SCRIPT__|$(readlink -f "$0")|g" "$WD_BIN"
+  # 把安装脚本自身固化到 /usr/local/libexec，供看护每日 --verify 调用。
+  # curl|bash 时 $0=bash，readlink 不可靠；用 BASH_SOURCE，定位失败则禁用 verify。
+  WD_SELF="${BASH_SOURCE[0]:-}"
+  INSTALL_SCRIPT_PATH=""
+  if [[ -n "$WD_SELF" && -r "$WD_SELF" ]]; then
+    install -d -m 0755 /usr/local/libexec 2>/dev/null || true
+    if install -m 0755 "$WD_SELF" /usr/local/libexec/mtg-install.sh 2>/dev/null; then
+      INSTALL_SCRIPT_PATH="/usr/local/libexec/mtg-install.sh"
+    fi
+  fi
+  # 字面量替换，避免路径中的 | & 破坏 sed 表达式
+  awk -v p="$INSTALL_SCRIPT_PATH" '{ gsub(/__INSTALL_SCRIPT__/, p); print }' "$WD_BIN" > "${WD_BIN}.tmp"
+  mv -f "${WD_BIN}.tmp" "$WD_BIN"
+  chmod 0755 "$WD_BIN"
+  if [[ -z "$INSTALL_SCRIPT_PATH" ]]; then
+    warn "无法定位安装脚本自身，看护的每日 verify 已禁用（巡检/自愈仍正常）"
+  fi
 
   info "安装看护 unit/timer"
   cat > "$WD_UNIT" <<EOF
@@ -1068,6 +1101,7 @@ After=mtg.service
 Type=oneshot
 Nice=10
 IOSchedulingClass=idle
+Environment=WD_SERVICE=${SVC} WD_PORT=${LISTEN_PORT} WD_STATE_DIR=/var/lib/mtg-watchdog
 ExecStart=${WD_BIN}
 EOF
   chmod 0644 "$WD_UNIT"
@@ -1187,6 +1221,9 @@ StartLimitBurst=5
 Type=simple
 User=mtg
 Group=mtg
+# 看护检测到假死时会发 SIGQUIT 抓 goroutine 栈。实测：不设置 GOTRACEBACK=all
+# 时 mtg 只输出一行 "SIGQUIT: quit"，拿不到栈；设为 all 才能dump全部goroutine。
+Environment=GOTRACEBACK=all
 ExecStart=${BIN} run ${CONF}
 Restart=always
 RestartSec=3
@@ -1219,7 +1256,9 @@ systemctl restart "$SVC"
 write_watchdog
 systemctl daemon-reload
 WD_TIMER_ENABLED=0
-if systemctl enable --now "$WD_TIMER" >/dev/null 2>&1; then
+# 注意：systemctl 必须传 unit 名，不能传 unit 文件路径，
+# 否则 systemd 直接报 "Invalid argument"，看护永远不会被启用。
+if systemctl enable --now "$WD_TIMER_UNIT" >/dev/null 2>&1; then
   WD_TIMER_ENABLED=1
 fi
 
@@ -1243,7 +1282,7 @@ info "日志：journalctl -u ${SVC} 看服务本身，journalctl -t mtg-watchdog
 apply_sysctl
 firewall_hint "$LISTEN_PORT"
 
-if systemctl is-enabled --quiet "$WD_TIMER" && systemctl is-active --quiet "$WD_TIMER"; then
+if systemctl is-enabled --quiet "$WD_TIMER_UNIT" && systemctl is-active --quiet "$WD_TIMER_UNIT"; then
   info "看护已启用：每 60s 检查一次（日志 journalctl -t mtg-watchdog）"
 else
   warn "看护 timer 未正常启用（enable 结果: ${WD_TIMER_ENABLED:-0}）"
@@ -1253,7 +1292,7 @@ fi
 
 write_deploy_info() {
   local wd_state sysctl_state deploy_dir
-  wd_state="$(systemctl is-active "$WD_TIMER" 2>/dev/null || true)"
+  wd_state="$(systemctl is-active "$WD_TIMER_UNIT" 2>/dev/null || true)"
   [[ -n "$wd_state" ]] || wd_state="unknown"
   if [[ -f "$SYSCTL_FILE" ]]; then
     sysctl_state="存在"
