@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# mtg (MTProto proxy) 一键部署脚本  v2.2
+# mtg (MTProto proxy) 一键部署脚本  v2.2.2
 #
 # 上游: https://github.com/9seconds/mtg  (MIT License)
 # 本脚本不执行任何未校验的远程内容。
@@ -166,6 +166,15 @@ show_links() {
 # ---------- verify 模式：真握手，不看"服务起来了" ----------
 # 只有拿到 Telegram 的 resPQ 才算可用。服务 active + 端口监听都可能是假阳性。
 
+# 探测 python3 是否具备可用 AES 实现。
+# 上游 pycryptodome 用 Crypto 命名空间，Debian 13 的 python3-pycryptodome
+# 只提供 Cryptodome，因此优先 Crypto、回退 Cryptodome；两者都无则返回非零。
+have_python_aes() {
+  python3 -c 'import Crypto; from Crypto.Cipher import AES' 2>/dev/null && return 0
+  python3 -c 'import Cryptodome; from Cryptodome.Cipher import AES' 2>/dev/null && return 0
+  return 1
+}
+
 # 按发行版尝试补装 pycryptodome；失败返回非零由调用方降级
 try_install_pycryptodome() {
   if command -v apt-get >/dev/null 2>&1; then
@@ -329,10 +338,10 @@ do_verify_inner() {
 
   local need_python=1
   if command -v python3 >/dev/null 2>&1; then
-    if python3 -c 'import Crypto' 2>/dev/null; then
+    if have_python_aes; then
       need_python=0
     else
-      warn "已找到 python3，但缺少 pycryptodome，无法执行完整端到端验证"
+      warn "已找到 python3，但缺少可用的 pycryptodome（Crypto/Cryptodome），无法执行完整端到端验证"
       if [[ -t 0 ]] && command -v read >/dev/null 2>&1; then
         local ans=""
         read -r -p "是否现在安装 python3-pycryptodome？[y/N] " ans || ans=""
@@ -340,7 +349,7 @@ do_verify_inner() {
           y|Y|yes|YES)
             info "尝试安装 python3-pycryptodome ..."
             if try_install_pycryptodome >/dev/null 2>&1 \
-               && python3 -c 'import Crypto' 2>/dev/null; then
+               && have_python_aes; then
               info "安装成功，继续完整验证"
               need_python=0
             else
@@ -369,7 +378,10 @@ do_verify_inner() {
 
   MTG_SECRET="$secret" python3 - "$ip" "$port" <<'PYEOF'
 import os, sys, socket, struct, hmac, hashlib, time, base64
-from Crypto.Cipher import AES
+try:
+    from Crypto.Cipher import AES
+except ImportError:
+    from Cryptodome.Cipher import AES
 
 def die(msg):
     print("  [x] " + msg)
